@@ -285,7 +285,18 @@ class SqliteBackend(DatabaseBackend):
             tokens_in   = coalesce(excluded.tokens_in, calls.tokens_in),
             tokens_out  = coalesce(excluded.tokens_out, calls.tokens_out),
             error       = excluded.error,
-            stage       = excluded.stage
+            stage       = excluded.stage,
+            -- `coalesce`, not a plain assignment, for the same reason as the token
+            -- counts: the finishing write does not always carry metadata, and
+            -- `meta_json = excluded.meta_json` would then erase what the starting write
+            -- recorded — the URL and question a call was about.
+            --
+            -- Omitting this line entirely was the original bug. Metadata added when a
+            -- call *finishes* was silently discarded, because the conflict clause only
+            -- updates the columns it names. It cost nothing until the client began
+            -- recording timing at the end of a call: the values were computed, passed,
+            -- accepted and dropped, and the only symptom was an empty column.
+            meta_json   = coalesce(excluded.meta_json, calls.meta_json)
         """
 
     def upsert_payload(self) -> str:
@@ -578,7 +589,10 @@ class MySqlBackend(DatabaseBackend):
             tokens_in   = coalesce(values(tokens_in), tokens_in),
             tokens_out  = coalesce(values(tokens_out), tokens_out),
             error       = values(error),
-            stage       = values(stage)
+            stage       = values(stage),
+            -- See the SQLite backend for why this is a coalesce and why its absence was
+            -- a bug: metadata recorded when a call finishes was accepted and dropped.
+            meta_json   = coalesce(values(meta_json), meta_json)
         """
 
     def upsert_payload(self) -> str:

@@ -342,6 +342,56 @@ them with measured ones. Treat any budgeting done this way as a lower bound, and
 launching agents in the background where there is a choice, since the cost then stops
 being guesswork.
 
+## Model benchmark: measured baseline, and three timing corrections (2026-09-08)
+
+`scripts/benchmark_models.py` replays recorded `extract_claims` calls from the call log
+against any model, so both models see byte-identical prompts and a difference cannot be
+explained by one having had easier work. Quality is scored by checking that each claim's
+verbatim `quote` actually occurs in the prompt - deterministic, offline, and not a model
+grading a model. See `src/local_llm/benchmark.py` for why that choice is not merely
+cheaper but more trustworthy.
+
+**Baseline — `qwen/qwen3-14b`, all layers on GPU, 3 replayed extractions (median prompt
+20,233 chars):**
+
+| metric | value |
+|---|---|
+| schema-valid | 3/3 |
+| decode speed (median) | **61.1 tok/s** |
+| time to first *answer* token | 8,551 ms — this is thinking time, not latency to first output |
+| total per call | 12,432 ms |
+| quote groundedness | **92%** (11/12; 22/24 over a separate 6-task run, so the figure is stable) |
+
+Three things were wrong before this was trustworthy, and all three were invisible:
+
+1. **`decode_tps` overstated speed by ~2.7×**, reporting 141-211 tok/s. Caught only because
+   this card's 896 GB/s over ~8.4 GiB of weights caps sequential decode near 106 tok/s, so
+   the number was above a hardware limit. Cause: `completion_tokens` counts reasoning *and*
+   answer tokens, while the decode window started at the first **answer** token — crediting
+   every token the model thought over only the seconds it spent speaking. The window now
+   opens at the first token of any kind. The corrected 61.1 tok/s agrees with the 69 tok/s
+   recorded elsewhere here for the coder 14B, which is independent corroboration.
+2. **`upsert_call` never updated `meta_json`**, in either backend. Anything recorded when a
+   call *finished* was computed, passed, accepted and dropped, with an empty column as the
+   only symptom. Both backends now use `coalesce(excluded.meta_json, calls.meta_json)`, so
+   a finishing write adds timing without erasing the URL and question stored at the start.
+3. **`lms load --estimate-only` excludes the KV cache and cannot be used as a fit check.**
+   It reports 8.38 GiB for qwen3-14b, self-reports "Confidence: LOW", and the model
+   actually occupies ~14,193 MiB resident. `VramBudget`'s own 1.66x factor is the more
+   honest estimate.
+
+A trap worth writing down: **the live database is MySQL** (`.env` sets
+`LOCAL_LLM_DATABASE__ENGINE=mysql`). `toolkit\.local-llm-data\calls.db` is a stale SQLite
+leftover holding 20 old rows that nothing reads or writes, and under the MySQL
+configuration `settings.db_path` returns the meaningless value `local_llm`. Half an hour
+went into "why are my rows not being recorded" before this was spotted.
+
+Also new: `ModelLoader.ensure(..., gpu_ratio=)` and `OffloadPlanner`, which allow a model
+larger than the card to be loaded with some layers deliberately left in system RAM. The
+pre-load fit check is skipped **only** when a ratio is passed, because a caller passing one
+has already decided the weights do not all fit; the post-load headroom verification still
+runs and remains the check that actually catches an overfilled card.
+
 ## Resume checklist
 
 ```powershell

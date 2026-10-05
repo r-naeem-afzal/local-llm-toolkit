@@ -178,6 +178,81 @@ class VramBudget:
         return True if free is None else free >= self._HEADROOM_MIB
 
 
+class OffloadPlanner:
+    """Works out how much of a too-large model to keep on the card.
+
+    Separate from both `VramBudget` (which answers "does it fit") and `ModelLoader` (which
+    drives the CLI) because this is a third question — "if it does not fit, what share
+    should go on the GPU?" — and it is a *policy* answer, tuned by measurement, while the
+    other two are facts.
+
+    ## The arithmetic, and why the reserve is a guess
+
+    VRAM has to hold three things: the weights placed on the card, the KV cache, and the
+    compute buffers. Only the first is being divided here, so the other two have to be
+    reserved before the division:
+
+        ratio = (free_when_empty - reserve) / weights
+
+        free 15,900 MiB, reserve 4,000, weights 19,072  ->  (15900-4000)/19072 = 0.62
+
+    The reserve is genuinely an estimate. The KV cache depends on the model's attention
+    geometry and the context length the server chooses, neither of which `lms` reports
+    before loading. Qwen3-30B-A3B is unusually cheap here — 48 layers with 4 key/value
+    heads works out near 96 KiB per token, about 3 GiB at a 32K context, *less* than the
+    14B it replaces despite being twice the size — but that is a per-model fact and this
+    class cannot know it.
+
+    So the number below is a deliberately generous starting point, and the honest workflow
+    is: plan a ratio, load, measure, adjust. `ModelLoader.ensure` verifies the card's state
+    afterwards and unloads if the reserve turned out to be too small, so a wrong guess
+    costs a failed load rather than a silently crawling one.
+
+    What breaks without the reserve: the ratio comes out near 1.0, every layer is placed on
+    a card with no room left for the cache, and the driver quietly moves the overflow into
+    system memory. That state does not raise an error and does not look different in
+    `nvidia-smi` — it just runs about fifteen times slower, which is the failure this whole
+    module exists to prevent.
+    """
+
+    #: VRAM held back for the KV cache and compute buffers, in MiB.
+    #:
+    #: Chosen as roughly a quarter of a 16 GB card. Calibration point: a 14B at a 30K
+    #: context needed about 4.7 GiB for the cache alone, so this is on the low side for a
+    #: dense model with many key/value heads and comfortable for a grouped-query
+    #: mixture-of-experts model. Raise it if a load succeeds and then runs slowly.
+    _RESERVE_MIB = 4000
+
+    def __init__(self, budget: VramBudget) -> None:
+        self._budget = budget
+
+    def ratio_for(self, weights_mib: int, *, reserve_mib: int | None = None,
+                  free_mib: int | None = None) -> float | None:
+        """The GPU share to request, or None when the whole model should fit anyway.
+
+        Returning None rather than 1.0 for the fits-entirely case is deliberate: None is
+        what `ModelLoader.ensure` interprets as "keep the normal whole-model path,
+        including its pre-load fit check". Passing an explicit 1.0 would skip that check
+        for no reason.
+        """
+        if not weights_mib:
+            return None
+        if self._budget.fits(weights_mib, already_free_mib=free_mib):
+            return None
+
+        available = free_mib if free_mib is not None else self._budget.total_mib()
+        if available is None:
+            # The card cannot be read. Refuse to invent a ratio — a wrong one is worse
+            # than none, because it would place layers on a card whose size is unknown.
+            return None
+
+        reserve = self._RESERVE_MIB if reserve_mib is None else reserve_mib
+        usable = available - reserve
+        if usable <= 0:
+            return 0.0
+        return min(usable / weights_mib, 1.0)
+
+
 class ModelLoader:
     """Ensures a named model is the one and only resident model, using the `lms` CLI.
 
@@ -212,6 +287,26 @@ class ModelLoader:
     # slot wants its own KV cache, so `--parallel 4` multiplies the memory pressure this
     # whole class exists to keep under control.
     _LOAD_OPTIONS = ("--gpu", "max", "--parallel", "1")
+
+    def _load_flags(self, gpu_ratio: float | None) -> list[str]:
+        """The `lms load` flags for this load, with the GPU share chosen by the caller.
+
+            gpu_ratio=None  ->  ["--gpu", "max",  "--parallel", "1"]   (all layers on GPU)
+            gpu_ratio=0.6   ->  ["--gpu", "0.6",  "--parallel", "1"]   (60% on GPU)
+
+        A ratio below 1 means part of the model is read from system RAM over PCIe during
+        generation. For a **dense** model that is close to useless — every layer is needed
+        for every token, so the slowest link sets the pace. It exists for **mixture-of-
+        experts** models, where only a small share of the weights participates in any one
+        token, and the idle remainder can sit in RAM costing nothing but address space.
+        """
+        if gpu_ratio is None:
+            return list(self._LOAD_OPTIONS)
+        # Clamped because `lms` rejects anything outside 0-1 and a caller computing a
+        # ratio from measured VRAM can land marginally outside by rounding — which would
+        # fail the load for a reason that has nothing to do with the model.
+        ratio = min(max(gpu_ratio, 0.0), 1.0)
+        return ["--gpu", f"{ratio:.2f}", "--parallel", "1"]
 
     def __init__(self, runner: Any, registry: Any, budget: VramBudget | None = None) -> None:
         self._runner = runner
@@ -281,8 +376,14 @@ class ModelLoader:
 
     # ── loading ──
 
-    def ensure(self, model_key: str, *, evict_others: bool = True) -> bool:
+    def ensure(self, model_key: str, *, evict_others: bool = True,
+               gpu_ratio: float | None = None) -> bool:
         """Make `model_key` the resident model. Returns whether it is, as far as we know.
+
+        `gpu_ratio` places only that share of the model's layers on the card, leaving the
+        rest in system RAM. Default None means "all of it", which is what any model that
+        fits should use. See `_load_flags` for when a ratio is worth setting — in short,
+        for a mixture-of-experts model and essentially never for a dense one.
 
         The sequence, and why each step is there:
 
@@ -342,7 +443,19 @@ class ModelLoader:
             )
             return False
 
-        if self._budget is not None and weights_mib:
+        # A caller asking for partial offload has *already decided* the weights do not all
+        # fit — that is what the ratio is for — so the whole-model fit check would refuse
+        # every such load by definition. Skipping it here is not dropping the safeguard:
+        # the post-load headroom verification below still runs, and it is the check that
+        # actually catches an overfilled card. The estimate can only reject the
+        # impossible, and "impossible" is the wrong word for a load that is deliberately
+        # placing some layers in system RAM.
+        #
+        # What breaks if this is left out: a mixture-of-experts model can never be loaded
+        # at all. An 18.6 GiB model estimates to roughly 31 GiB required against a 16 GiB
+        # card, so `fits` returns False and `ensure` keeps the smaller model — silently,
+        # from the caller's point of view, because the return value is a bare False.
+        if self._budget is not None and weights_mib and gpu_ratio is None:
             # Measured against an *empty* card rather than current free memory: everything
             # else is about to be unloaded, so the question is whether this model fits on
             # its own, not whether it fits alongside what happens to be loaded now.
@@ -361,7 +474,7 @@ class ModelLoader:
             self._run(["unload", "--all"])
             self._settle()
 
-        if not self._run(["load", model_key, *self._LOAD_OPTIONS, "-y"]):
+        if not self._run(["load", model_key, *self._load_flags(gpu_ratio), "-y"]):
             self.last_error = f"lms load {model_key} failed"
             return False
 

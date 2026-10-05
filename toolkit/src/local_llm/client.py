@@ -124,6 +124,28 @@ class StreamAccumulator:
     chunks: int = 0
     usage: dict[str, Any] | None = None
 
+    #: Milliseconds from request to the first *answer* token — "time to first token".
+    #: Written by the client rather than computed here, because the client already owns
+    #: the monotonic clock for the call and a second clock could disagree with the first.
+    #:
+    #: Kept separate from the total duration because the two halves of a completion have
+    #: completely different costs, and a single tokens-per-second figure hides that:
+    #:
+    #:   * **prefill** — reading the prompt — is compute-bound and happens once;
+    #:   * **decode** — emitting tokens — is memory-bandwidth-bound and happens per token.
+    #:
+    #: What breaks without this: comparing a model whose weights are entirely in VRAM
+    #: against one partly offloaded to system RAM becomes meaningless. Offload penalises
+    #: decode far more than prefill, so `tokens_out / total_duration` can look similar for
+    #: the two while the actual generation speed differs several-fold. Any conclusion drawn
+    #: from the combined figure about whether offloading is viable would be wrong.
+    ttft_ms: int | None = None
+
+    #: Set on the first *reasoning* token, for the same reason. A hybrid-reasoning model
+    #: may think for many seconds before the first answer token, so `ttft_ms` alone cannot
+    #: distinguish "slow to start generating" from "spent ten seconds thinking first".
+    first_token_ms: int | None = None
+
     def consume(self, event: dict[str, Any]) -> str:
         """Fold one streamed event in, returning which channel it carried.
 
@@ -293,11 +315,11 @@ class LocalLLMClient(CompletionClient):
         try:
             await self._stream(body, accumulator, reporter, elapsed_ms)
         except LocalLLMError as exc:
-            self._fail(call_id, str(exc), elapsed_ms(), accumulator)
+            self._fail(call_id, str(exc), elapsed_ms(), accumulator, meta)
             raise
         except httpx.TimeoutException as exc:
             message = f"local model timed out after {self._settings.request_timeout_s}s"
-            self._fail(call_id, message, elapsed_ms(), accumulator)
+            self._fail(call_id, message, elapsed_ms(), accumulator, meta)
             raise LocalLLMError(message) from exc
         except httpx.HTTPError as exc:
             # Deliberately names the fix. A refused connection almost always means the
@@ -307,10 +329,10 @@ class LocalLLMClient(CompletionClient):
                 f"cannot reach local model at {self._settings.url} — is the server "
                 f"running? (lms server start): {exc}"
             )
-            self._fail(call_id, message, elapsed_ms(), accumulator)
+            self._fail(call_id, message, elapsed_ms(), accumulator, meta)
             raise LocalLLMError(message) from exc
 
-        return self._finish(call_id, accumulator, schema, elapsed_ms(), token_budget)
+        return self._finish(call_id, accumulator, schema, elapsed_ms(), token_budget, meta)
 
     # ── request construction ──
 
@@ -398,30 +420,105 @@ class LocalLLMClient(CompletionClient):
 
                     phase = accumulator.consume(event)
                     if phase != "none":
+                        # Stamp the first token of each kind as it arrives. Done here
+                        # rather than inside the accumulator because `elapsed_ms` is the
+                        # call's own monotonic clock, started before the request was
+                        # sent — so these figures share an origin with the recorded
+                        # duration and can be subtracted from it meaningfully.
+                        if accumulator.first_token_ms is None:
+                            accumulator.first_token_ms = elapsed_ms()
+                        if phase == "content" and accumulator.ttft_ms is None:
+                            accumulator.ttft_ms = elapsed_ms()
                         reporter.maybe_report(accumulator, phase, elapsed_ms())
 
     # ── completion bookkeeping ──
 
+    @staticmethod
+    def _timing_meta(accumulator: StreamAccumulator, duration_ms: int,
+                     caller_meta: dict | None) -> dict:
+        """The caller's metadata with prefill/decode timing folded in.
+
+        Timing goes into `meta_json` rather than into new columns on the `calls` table
+        because meta is exactly the place for facts *about* a call that not every caller
+        produces, and adding a column means editing the schema statements, the upsert SQL
+        and the migration list for a figure only some rows will carry.
+
+            caller_meta={"url": "https://x"}, first token at 240ms, first *answer* token
+            at 7,800ms, 589 completion tokens, 12,900ms total
+              ->  {"url": "https://x", "first_token_ms": 240, "ttft_ms": 7800,
+                   "decode_ms": 12660, "decode_tps": 46.5}
+
+        Three timings because they answer three different questions:
+
+        * `first_token_ms` — how long prefill took. When decode begins.
+        * `ttft_ms` — how long until the *answer* began. On a reasoning model the gap
+          between these two is time spent thinking, which is the caller's felt latency.
+        * `decode_tps` — generation speed: every token emitted, reasoning included,
+          divided by the time spent emitting them. This is the figure worth comparing
+          between models, because it is the one the hardware determines.
+
+        What breaks without the subtraction: a long prompt makes a fast model look slow.
+        Extraction calls here run 6,000-token prompts, where prefill is seconds — so
+        `tokens_out / duration_ms` would rank models mostly by how much prompt they were
+        handed rather than by how fast they generate.
+        """
+        meta = dict(caller_meta or {})
+        ttft = accumulator.ttft_ms
+        emitted = (accumulator.usage or {}).get("completion_tokens")
+
+        if ttft is not None:
+            meta["ttft_ms"] = ttft
+        if accumulator.first_token_ms is not None:
+            meta["first_token_ms"] = accumulator.first_token_ms
+
+        # The decode window opens at the first token of **any** kind, not at the first
+        # answer token, and this distinction was measured rather than reasoned about.
+        #
+        # `completion_tokens` counts reasoning tokens together with answer tokens — on a
+        # hybrid-reasoning model most of them are reasoning. Dividing that total by the
+        # time after the *answer* began credits the model with every token it thought,
+        # over only the seconds it spent speaking. The first version of this did exactly
+        # that and reported 141-211 tok/s for a 14B on a card whose memory bandwidth caps
+        # sequential decode near 106 tok/s: a figure above the hardware limit, which is
+        # how the error announced itself.
+        #
+        # Emitting a reasoning token costs the same work as emitting an answer token, so
+        # the honest denominator is everything after generation started.
+        start = accumulator.first_token_ms
+        if start is not None and emitted and duration_ms > start:
+            decode_ms = duration_ms - start
+            meta["decode_ms"] = decode_ms
+            meta["decode_tps"] = round(emitted * 1000.0 / decode_ms, 1)
+
+        return meta
+
     def _fail(self, call_id: str, message: str, duration_ms: int,
-              accumulator: StreamAccumulator) -> None:
+              accumulator: StreamAccumulator, caller_meta: dict | None = None) -> None:
         self._repository.finish_call(
             call_id, status="error", error=message, duration_ms=duration_ms,
             usage=accumulator.usage, reasoning=accumulator.reasoning or None,
+            meta=self._timing_meta(accumulator, duration_ms, caller_meta),
         )
         # Always clear the live entry, or a failed call would linger in the dashboard as
         # permanently "running" and the display would show phantom activity forever.
         self._live.clear(call_id)
 
     def _finish(self, call_id: str, accumulator: StreamAccumulator,
-                schema: type[T] | None, duration_ms: int, token_budget: int) -> Any:
+                schema: type[T] | None, duration_ms: int, token_budget: int,
+                caller_meta: dict | None = None) -> Any:
         text = self._stripper.strip(accumulator.content)
         reasoning = accumulator.reasoning or None
+        # Computed once and reused by all four exit paths below, so a call that fails
+        # schema validation still records how fast the model produced the bad output.
+        # Without that, the log would carry timings only for successes and any average
+        # drawn from it would be biased towards whatever the model finds easy.
+        meta = self._timing_meta(accumulator, duration_ms, caller_meta)
 
         if not text:
             message = self._describe_empty_output(accumulator, token_budget)
             self._repository.finish_call(
                 call_id, status="error", error=message, duration_ms=duration_ms,
-                usage=accumulator.usage, reasoning=reasoning,
+                usage=accumulator.usage, reasoning=reasoning, meta=meta,
             )
             self._live.clear(call_id)
             raise LocalLLMError(message)
@@ -429,7 +526,7 @@ class LocalLLMClient(CompletionClient):
         if schema is None:
             self._repository.finish_call(
                 call_id, status="ok", duration_ms=duration_ms, usage=accumulator.usage,
-                response=text, reasoning=reasoning,
+                response=text, reasoning=reasoning, meta=meta,
             )
             self._live.clear(call_id)
             return text
@@ -443,7 +540,7 @@ class LocalLLMClient(CompletionClient):
             self._repository.finish_call(
                 call_id, status="error", error=f"schema validation failed: {exc}",
                 duration_ms=duration_ms, usage=accumulator.usage, response=text,
-                reasoning=reasoning,
+                reasoning=reasoning, meta=meta,
             )
             self._live.clear(call_id)
             raise LocalLLMError(
@@ -452,7 +549,7 @@ class LocalLLMClient(CompletionClient):
 
         self._repository.finish_call(
             call_id, status="ok", duration_ms=duration_ms, usage=accumulator.usage,
-            response=text, reasoning=reasoning,
+            response=text, reasoning=reasoning, meta=meta,
         )
         self._live.clear(call_id)
         return validated
