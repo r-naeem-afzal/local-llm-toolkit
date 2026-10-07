@@ -31,6 +31,13 @@ from .extract import ClaimExtractor, ExtractorChain, PageFetcher, PromptLibrary,
 from .membership import ListMembershipChecker
 from .loader import ModelLoader, VramBudget
 from .routing import ModelRouter
+from .server_start import (
+    LockFile,
+    LmsServerCommand,
+    ModelServerStarter,
+    PsutilMemory,
+    SystemClock,
+)
 from .monitor import (
     ClaudeUsageReader,
     GpuProbe,
@@ -194,6 +201,29 @@ class Toolkit:
         outright about as often as it succeeds — see `loader.py` for the measurement.
         """
         return ModelLoader(self.lms, self.model_registry, self.vram_budget)
+
+    @cached_property
+    def server_starter(self) -> ModelServerStarter:
+        """Brings the model server up and the default model in, for unattended callers.
+
+        Built from the same probe, loader and budget the dashboard uses, so its refusal
+        to load and the dashboard's picture of the card come from one reading, not two.
+        """
+        clock = SystemClock()
+        return ModelServerStarter(
+            settings=self._settings,
+            probe=self.server_probe,
+            command=LmsServerCommand(self.lms.executable_path),
+            loader=self.loader,
+            budget=self.vram_budget,
+            memory=PsutilMemory(),
+            lock=LockFile(
+                self._settings.server_start_lock_path,
+                clock,
+                self._settings.server_start_lock_stale_s,
+            ),
+            clock=clock,
+        )
 
     @cached_property
     def gpu_probe(self) -> GpuProbe:

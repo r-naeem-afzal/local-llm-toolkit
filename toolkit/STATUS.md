@@ -392,6 +392,25 @@ pre-load fit check is skipped **only** when a ratio is passed, because a caller 
 has already decided the weights do not all fit; the post-load headroom verification still
 runs and remains the check that actually catches an overfilled card.
 
+## Unattended server start (proven with fakes only)
+
+`python -m local_llm.server_start [--model KEY] [--no-load] [--json]` makes sure the model
+server is up and the default model is loaded, for a caller with nobody at the keyboard
+(dayshift). It exits 0 only when the server answers and, unless `--no-load`, the model is
+loaded; `--json` prints one line with the result's fields.
+
+What it checks, in order, each step with a time limit: whether the server already answers;
+if not, `lms server start`, run once more if the server still does not answer (the cold
+start quirk above), then a bounded wait of 30 seconds; free system RAM against a floor
+(`LOCAL_LLM_MIN_FREE_RAM_MIB`, default 6144); that the GPU can be read at all (an unreadable
+GPU means "do not load" here, the opposite of `VramBudget.fits`); then
+`ModelLoader.ensure`, whose own VRAM guards decide. One lock file in the data directory
+(`server-start.lock`, taken over after 10 minutes) keeps two starters from racing.
+
+**Status: unit tests with fakes only** (`tests/test_server_start.py`). It has not yet been
+run against the real `lms` or a real load; the first real run will confirm the assumptions
+about `lms server start` output and exit codes.
+
 ## Resume checklist
 
 ```powershell

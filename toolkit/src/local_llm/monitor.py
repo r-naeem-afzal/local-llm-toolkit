@@ -416,6 +416,15 @@ class LmsCommandRunner:
         # home directory finds nothing and wastes real time.
         return Path(os.path.expanduser("~")) / ".lmstudio" / "bin" / "lms.exe"
 
+    def executable_path(self) -> Path:
+        """Where the `lms` CLI is expected to be (it may not exist there).
+
+        Public so other classes that must run `lms` themselves (the server starter runs
+        `lms server start`, which has no JSON form) find it by the same rule instead of
+        copying the home-directory logic and drifting from it.
+        """
+        return self._executable()
+
     def run(self, *args: str) -> Any:
         """Run `lms <args> --json` and return the parsed result, or None on any failure.
 
@@ -578,6 +587,18 @@ class ModelServerProbe:
             return self._cached[1]
         result = self._probe()
         self._cached = (now, result)
+        return result
+
+    def is_up_now(self) -> bool:
+        """Ask the server right now, ignoring the cache.
+
+        `is_up` may return an answer up to 2 seconds old. A caller that has just run a
+        command to change the answer (starting the server) must not be told the old one:
+        it would conclude the command failed and run it again, or give up, when the server
+        came up a moment after the cached "no".
+        """
+        result = self._probe()
+        self._cached = (time.monotonic(), result)
         return result
 
     def _probe(self) -> bool:

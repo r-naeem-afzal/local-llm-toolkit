@@ -243,6 +243,22 @@ class Settings(BaseSettings):
     lms_path: Path | None = None
     claude_projects_dir: Path | None = None
 
+    # ── unattended server start (server_start.py) ──
+    # Refuse to load a model when less than this much system RAM is free. The runtime
+    # memory-maps the model file, so a load takes host RAM as well as VRAM; starting one
+    # on a machine with no RAM to spare makes Windows page to disk and the whole PC
+    # crawls, which with nobody home is not noticed until the day is lost. 6144 MiB is
+    # 6 GiB, about the host-side cost of the 14B default plus the desktop's own needs.
+    min_free_ram_mib: int = Field(default=6144, ge=0)
+    # Longest one `lms server start` call may run before it is killed. Cold start prints
+    # "Timed out waiting for LM Studio daemon to start" by itself after a while, so this
+    # is only the backstop for a call that never returns at all.
+    server_start_cmd_timeout_s: float = Field(default=60.0, gt=0)
+    # How long to wait for the endpoint to answer after the start commands have run.
+    server_start_wait_s: float = Field(default=30.0, gt=0)
+    # A lock file older than this is treated as left behind by a crashed starter.
+    server_start_lock_stale_s: float = Field(default=600.0, gt=0)
+
     # ── live Claude agent view ──
     # How long a *finished* agent stays on the dashboard. Finished agents linger instead
     # of vanishing because the dashboard detects a completion by watching a row change
@@ -287,6 +303,10 @@ class Settings(BaseSettings):
         line — need not reach into the nested config.
         """
         return self.database.resolved_sqlite_path(self.data_dir)
+
+    @property
+    def server_start_lock_path(self) -> Path:
+        return self.data_dir / "server-start.lock"
 
     @property
     def live_dir(self) -> Path:
