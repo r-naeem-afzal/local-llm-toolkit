@@ -1,4 +1,4 @@
-"""Making sure the model server is up and its default model is loaded, with nobody watching.
+"""Making sure the model server is up and a model is loaded, with nobody watching.
 
 An unattended tool (dayshift) calls this at the start of a working day. That caller cannot
 answer a prompt, cannot notice a frozen window and cannot press a key, so the contract is
@@ -19,8 +19,26 @@ Run it by hand with:
     1. server answering?            yes -> skip to 3
     2. `lms server start`           (twice if the first did not work, see below)
        then wait a bounded time for the server to answer
-    3. unless --no-load:  RAM above the floor?  GPU readable?  ModelLoader.ensure(model)
+    3. unless --no-load, for each model to try, in order:
+           RAM above the floor?  GPU readable?  ModelLoader.ensure(model)
+       and stop at the first model that loads
     4. all of it under one lock file, so two starters cannot race
+
+## Which models, and what happens when the first does not load
+
+With no `--model`, the starter tries `Settings.unattended_models` in order, by default the
+14B and then the 9B. A day on which other programs hold part of the card can refuse the
+14B and still have room for the 9B, and a shift with some model loaded is worth more than
+a shift with none. The result says which model loaded (`model`); when none did, `error`
+gives the reason for each.
+
+`--model KEY` means exactly that model and never falls back. A person who names a model is
+testing it or needs it, and a run that loaded a different one while reporting success
+would leave them believing the one they named was resident.
+
+The RAM floor and the unreadable-GPU refusal are checked again before every attempt, not
+only the first. A failed attempt changes the machine (a model was mapped into RAM, loaded
+and unloaded), so a reading taken before attempt one can be wrong by attempt two.
 
 ## Why `lms server start` may run twice
 
@@ -61,16 +79,28 @@ class StartResult:
                          refused="", error="", ...)
         RAM too low
           -> server_up=True, model_loaded=False, refused="free RAM 3100 MiB is below ..."
+        the 14B would not load but the 9B did
+          -> model="qwen/qwen3.5-9b", model_loaded=True, error=""
+        neither would load
+          -> model="qwen/qwen3-14b", model_loaded=False,
+             error="qwen/qwen3-14b needs about ...; qwen/qwen3.5-9b loaded but left only ..."
     """
 
     server_up: bool
     server_started_by_us: bool
+    # The model that loaded. When none did, the first model the run would have tried, so
+    # a refusal or an error still names the model that was wanted.
     model: str
     model_loaded: bool
-    # A deliberate decision not to load ("RAM too low"). Not a failure of the tool.
+    # A deliberate decision not to load ("RAM too low"). Not a failure of the tool. Only
+    # set when the run was stopped before any model had been tried and failed: once an
+    # attempt has failed, every later reason goes into `error` instead, so a caller that
+    # reads only one of the two fields sees all of them.
     refused: str
     # Something went wrong ("lms.exe not found", "server never answered", the loader's
-    # last_error). Empty when everything went to plan.
+    # last_error). When several models were tried and none loaded, one reason per model,
+    # joined with "; ". Empty when everything went to plan, including when a later model
+    # loaded after an earlier one did not.
     error: str
     vram_free_mib: int | None
     ram_free_mib: int | None
@@ -301,8 +331,27 @@ class LockFile:
 # ─────────────────────────── the starter ───────────────────────────
 
 
+@dataclass(frozen=True)
+class _GuardReading:
+    """What the two load guards saw just before one load attempt.
+
+        RAM 20000 MiB free, GPU 14000 MiB free
+          ->  _GuardReading(ram_mib=20000, vram_mib=14000, refusal="")
+        RAM 3100 MiB free, floor 6144
+          ->  _GuardReading(ram_mib=3100, vram_mib=None,
+                            refusal="free RAM is 3100 MiB, below the 6144 MiB floor; ...")
+
+    Frozen (cannot be changed after it is made) because it is a record of a moment: a
+    caller that logs it and passes it on cannot accidentally log a different story.
+    """
+
+    ram_mib: int | None
+    vram_mib: int | None     # None when not read (RAM already refused) or unreadable
+    refusal: str             # "" means the attempt may go ahead
+
+
 class ModelServerStarter:
-    """Brings the model server up and the model in, safely. See the module docstring."""
+    """Brings the model server up and a model in, safely. See the module docstring."""
 
     # Gap between "is it answering yet" checks. Longer than the probe's 2 s cache so every
     # check is a fresh answer, and long enough not to hammer a server that is booting.
@@ -321,38 +370,60 @@ class ModelServerStarter:
 
     def ensure_ready(self, model_key: str | None = None, load_model: bool = True) -> StartResult:
         """Run the whole sequence once and return what happened. Does not raise for
-        expected failures; those come back as `refused` or `error`."""
-        model = model_key or self._settings.model
+        expected failures; those come back as `refused` or `error`.
+
+            ensure_ready()                  ->  tries Settings.unattended_models in order
+            ensure_ready(model_key="a/b")   ->  tries "a/b" and nothing else
+        """
+        candidates = self._candidates(model_key)
         began = self._clock.monotonic()
 
         if not self._lock.acquire():
             return self._finish(
-                began, model, server_up=self._probe.is_up_now(),
+                began, candidates[0], server_up=self._probe.is_up_now(),
                 refused=f"another starter holds the lock at {self._lock.path}; "
                         f"started nothing",
             )
         # `finally` so the lock is removed even when something below raises. A leaked lock
         # would block every later run until it aged out ten minutes later.
         try:
-            return self._run(began, model, load_model)
+            return self._run(began, candidates, load_model)
         finally:
             self._lock.release()
 
+    def _candidates(self, model_key: str | None) -> list[str]:
+        """The models to try, in order.
+
+            model_key="qwen/qwen3-4b"  ->  ["qwen/qwen3-4b"]
+            model_key=None             ->  ["qwen/qwen3-14b", "qwen/qwen3.5-9b"]   (the setting)
+
+        A named model means exactly that model, with no fallback. Why: someone who names a
+        model is testing it or needs it, not asking for "it, or whatever else loads". What
+        happens as a result: if it will not load, the run says so and stops. What breaks if
+        a named model fell back: a run that asked for the 14B could report success having
+        loaded the 9B, and the caller would go on believing the 14B was resident.
+        """
+        if model_key:
+            return [model_key]
+        return list(self._settings.unattended_models)
+
     # ── steps ──
 
-    def _run(self, began: float, model: str, load_model: bool) -> StartResult:
+    def _run(self, began: float, candidates: list[str], load_model: bool) -> StartResult:
         started_by_us = False
         if not self._probe.is_up_now():
             error = self._start_server()
             if error:
-                return self._finish(began, model, server_up=False, error=error)
+                return self._finish(began, candidates[0], server_up=False, error=error)
             # It was down when we arrived and answers now, so our commands did it.
             started_by_us = True
 
         if not load_model:
-            return self._finish(began, model, server_up=True, started_by_us=started_by_us)
+            return self._finish(
+                began, candidates[0], server_up=True, started_by_us=started_by_us
+            )
 
-        return self._load(began, model, started_by_us)
+        return self._load(began, candidates, started_by_us)
 
     def _start_server(self) -> str:
         """Start the server. Returns "" once it answers, or a plain error sentence."""
@@ -385,16 +456,71 @@ class ModelServerStarter:
         return (f"the model server did not answer within {wait_s:.0f} seconds of "
                 f"`lms server start` (last call: {detail}).{output}")
 
-    def _load(self, began: float, model: str, started_by_us: bool) -> StartResult:
+    def _load(self, began: float, candidates: list[str], started_by_us: bool) -> StartResult:
+        """Try each model in turn and stop at the first that loads, guarding every attempt.
+
+        The ways this ends, and which field carries the story:
+
+            the first model loads                        ->  model=14B, loaded, no error
+            the 14B fails, the 9B loads                  ->  model=9B, loaded, no error
+            every model fails                            ->  model=14B (first choice), not
+                                                             loaded, error = one reason each
+            a guard refuses before any model was tried   ->  model=14B, not loaded, refused
+            a guard refuses after one model had failed   ->  model=14B, not loaded, error =
+                                                             that failure plus "the 9B was
+                                                             not tried: <the guard's words>"
+
+        The last case goes into `error`, not `refused`, so that a caller reading only one
+        of the two fields (dayshift reads `refused` first, then `error`) still sees the
+        failed attempt as well as the refusal.
+        """
+        failures: list[str] = []
+        reading = _GuardReading(ram_mib=None, vram_mib=None, refusal="")
+
+        for model in candidates:
+            # Read again before every attempt, not once before the first. A failed attempt
+            # changes the machine: a model was mapped into RAM, loaded, found too large
+            # and unloaded. What breaks with one early reading: attempt two goes ahead on
+            # a RAM figure from before attempt one, on a machine that may no longer pass
+            # the guard that attempt one passed.
+            reading = self._read_guards()
+            if reading.refusal:
+                if not failures:
+                    return self._finish(
+                        began, candidates[0], server_up=True, started_by_us=started_by_us,
+                        ram=reading.ram_mib, vram=reading.vram_mib, refused=reading.refusal,
+                    )
+                failures.append(f"{model} was not tried: {reading.refusal}")
+                break
+
+            if self._loader.ensure(model):
+                return self._finish(
+                    began, model, server_up=True, started_by_us=started_by_us,
+                    loaded=True, ram=reading.ram_mib, vram=reading.vram_mib,
+                )
+            failures.append(self._loader.last_error or f"could not load {model}")
+
+        return self._finish(
+            began, candidates[0], server_up=True, started_by_us=started_by_us,
+            error=self._join_reasons(failures), ram=reading.ram_mib, vram=reading.vram_mib,
+        )
+
+    def _read_guards(self) -> _GuardReading:
+        """Check free RAM, then GPU readability, and say whether a load may go ahead.
+
+            RAM 20000, floor 6144, GPU 14000 MiB free  ->  may go ahead, refusal ""
+            RAM 3100, floor 6144                       ->  refusal "free RAM is 3100 MiB ..."
+            RAM fine, GPU cannot be read               ->  refusal "the GPU memory could ..."
+        """
         ram = self._memory.free_ram_mib()
         floor = self._settings.min_free_ram_mib
         # Unknown RAM is allowed through, like the monitor: psutil is a declared
         # dependency, so None means a freak read failure, and RAM is a coarse guard. The
         # GPU check below is the strict one.
         if ram is not None and ram < floor:
-            return self._finish(
-                began, model, server_up=True, started_by_us=started_by_us, ram=ram,
-                refused=f"free RAM is {ram} MiB, below the {floor} MiB floor; "
+            return _GuardReading(
+                ram_mib=ram, vram_mib=None,
+                refusal=f"free RAM is {ram} MiB, below the {floor} MiB floor; "
                         f"the model was not loaded",
             )
 
@@ -407,18 +533,32 @@ class ModelServerStarter:
             # full card does not fail: Windows spills it into system RAM and everything
             # runs about fifteen times slower, silently, all day. Refusing costs one
             # visible "not loaded" message that the owner sees and fixes in a minute.
-            return self._finish(
-                began, model, server_up=True, started_by_us=started_by_us, ram=ram,
-                refused="the GPU memory could not be read, so the model was not loaded "
+            return _GuardReading(
+                ram_mib=ram, vram_mib=None,
+                refusal="the GPU memory could not be read, so the model was not loaded "
                         "(unattended runs do not load blind)",
             )
+        return _GuardReading(ram_mib=ram, vram_mib=vram, refusal="")
 
-        loaded = self._loader.ensure(model)
-        error = "" if loaded else (self._loader.last_error or f"could not load {model}")
-        return self._finish(
-            began, model, server_up=True, started_by_us=started_by_us,
-            loaded=loaded, error=error, ram=ram, vram=vram,
-        )
+    @staticmethod
+    def _join_reasons(reasons: list[str]) -> str:
+        """One sentence per distinct reason, in the order the attempts happened.
+
+            ["A needs about 14227 MiB", "B loaded but left only 170 MiB free"]
+              ->  "A needs about 14227 MiB; B loaded but left only 170 MiB free"
+            ["A needs about 14227 MiB", "A needs about 14227 MiB"]
+              ->  "A needs about 14227 MiB"
+
+        `dict.fromkeys` is the repeat-remover here: a dictionary holds each key once and
+        remembers the order keys first arrived in, so listing its keys gives the reasons
+        with repeats dropped and the order kept.
+
+        Repeats are dropped so that a run in which every attempt fails in the same words
+        reads exactly as it did when only one model was ever tried. The loader's own
+        messages each name their model, so in practice they differ; this is for a reason
+        that does not, which would otherwise be printed once per model.
+        """
+        return "; ".join(dict.fromkeys(reasons))
 
     def _finish(self, began: float, model: str, *, server_up: bool,
                 started_by_us: bool = False, loaded: bool = False, refused: str = "",
@@ -471,9 +611,13 @@ def main(argv: Sequence[str] | None = None, starter: ModelServerStarter | None =
     """
     parser = argparse.ArgumentParser(
         prog="python -m local_llm.server_start",
-        description="Make sure the local model server is up and its model is loaded.",
+        description="Make sure the local model server is up and a model is loaded.",
     )
-    parser.add_argument("--model", default=None, help="model key (default: the configured one)")
+    parser.add_argument(
+        "--model", default=None,
+        help="load exactly this model, with no fallback (default: try each model in "
+             "LOCAL_LLM_UNATTENDED_MODELS in order and keep the first that loads)",
+    )
     parser.add_argument("--no-load", action="store_true",
                         help="only make sure the server is up; do not load a model")
     parser.add_argument("--json", action="store_true", help="print one line of JSON")

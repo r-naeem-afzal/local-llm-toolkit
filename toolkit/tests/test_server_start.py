@@ -16,6 +16,7 @@ from local_llm.server_start import (
     LockFile,
     ModelServerStarter,
     StartResult,
+    describe,
     main,
 )
 
@@ -113,23 +114,28 @@ class Rig:
     def __init__(self, tmp_path: Path, *, up: bool = False, ups: list[bool] | None = None,
                  ran: bool = True, timed_out: bool = False, loader_ok: bool = True,
                  loader_error: str = "", vram: int | None = 14000, ram: int | None = 20000,
-                 probe_raises: bool = False) -> None:
+                 probe_raises: bool = False, loader=None, memory=None, budget=None,
+                 models: tuple[str, ...] | None = None) -> None:
+        # `loader`, `memory`, `budget` and `models` are optional extras for the tests of
+        # trying several models: they replace the plain fakes built from the arguments
+        # above, and leave every earlier test exactly as it was.
         self.clock = FakeClock()
         self.server = FakeServer(up)
         self.command = FakeCommand(self.server, ups if ups is not None else [True], ran,
                                    timed_out)
-        self.loader = FakeLoader(loader_ok, loader_error)
+        self.loader = loader if loader is not None else FakeLoader(loader_ok, loader_error)
         self.lock_path = tmp_path / "start.lock"
         self.lock = LockFile(self.lock_path, self.clock, stale_after_s=600)
+        extra = {} if models is None else {"unattended_models": models}
         self.starter = ModelServerStarter(
             # _env_file=None so a developer's real .env cannot change what a test sees.
             settings=Settings(model=MODEL, min_free_ram_mib=6144,
-                              server_start_wait_s=30, _env_file=None),
+                              server_start_wait_s=30, _env_file=None, **extra),
             probe=FakeProbe(self.server, probe_raises),
             command=self.command,
             loader=self.loader,
-            budget=FakeBudget(vram),
-            memory=FakeMemory(ram),
+            budget=budget if budget is not None else FakeBudget(vram),
+            memory=memory if memory is not None else FakeMemory(ram),
             lock=self.lock,
             clock=self.clock,
         )
@@ -371,3 +377,218 @@ def test_unexpected_exception_becomes_an_error_line_and_exit_one():
     code, lines, _ = run_main(["--json"], RuntimeError("boom"))
     assert code == 1
     assert json.loads(lines[0])["error"] == "RuntimeError: boom"
+
+
+# ─────────────────────────── several models ───────────────────────────
+#
+# With no model named the starter tries `Settings.unattended_models` in order, and stops at
+# the first that loads inside the guards. Naming one on the command line means that model
+# only. The loader here answers per model, so a test can say "the 14B is refused, the 9B
+# loads" in one line.
+
+FOURTEEN_B = "qwen/qwen3-14b"
+NINE_B = "qwen/qwen3.5-9b"
+REFUSED_14B = ("qwen/qwen3-14b needs about 14227 MiB but only 9000 MiB would be free "
+               "with nothing else loaded")
+NO_ROOM_9B = ("qwen/qwen3.5-9b loaded but left only 170 MiB free; unloaded it rather than "
+              "run in a state where allocations spill to system memory")
+
+
+class ScriptedLoader:
+    """A loader whose answer depends on the model asked for.
+
+    `outcomes` maps a model to None (it loads) or to the reason it is refused with. A model
+    that is not listed is refused as "not installed". Every model asked for is recorded.
+    """
+
+    def __init__(self, outcomes: dict[str, str | None]) -> None:
+        self._outcomes = outcomes
+        self.last_error = ""
+        self.asked: list[str] = []
+
+    def ensure(self, key: str) -> bool:
+        self.asked.append(key)
+        reason = self._outcomes.get(key, f"{key} is not installed")
+        self.last_error = reason or ""
+        return reason is None
+
+
+class SequenceMemory:
+    """Free RAM that changes between readings: each call returns the next value, and the
+    last value repeats. Stands for a machine that changes while an attempt is made."""
+
+    def __init__(self, readings: list[int | None]) -> None:
+        self._readings = list(readings)
+
+    def free_ram_mib(self) -> int | None:
+        return self._readings.pop(0) if len(self._readings) > 1 else self._readings[0]
+
+
+class SequenceBudget:
+    """The same idea for the GPU's free memory (None means it could not be read)."""
+
+    def __init__(self, readings: list[int | None]) -> None:
+        self._readings = list(readings)
+
+    def free_mib(self) -> int | None:
+        return self._readings.pop(0) if len(self._readings) > 1 else self._readings[0]
+
+
+def test_the_default_models_are_the_14b_then_the_9b():
+    assert Settings(_env_file=None).unattended_models == (FOURTEEN_B, NINE_B)
+
+
+def test_the_first_model_that_loads_ends_the_search(tmp_path):
+    loader = ScriptedLoader({FOURTEEN_B: None, NINE_B: None})
+    result = Rig(tmp_path, up=True, loader=loader).starter.ensure_ready()
+    assert loader.asked == [FOURTEEN_B]
+    assert result.model == FOURTEEN_B and result.model_loaded and result.error == ""
+
+
+def test_the_second_model_is_tried_when_the_first_is_refused(tmp_path):
+    loader = ScriptedLoader({FOURTEEN_B: REFUSED_14B, NINE_B: None})
+    result = Rig(tmp_path, up=True, loader=loader).starter.ensure_ready()
+    assert loader.asked == [FOURTEEN_B, NINE_B]
+    assert result.model == NINE_B and result.model_loaded
+    assert result.error == "" and result.refused == ""
+    assert result.vram_free_mib == 14000 and result.ram_free_mib == 20000
+
+
+def test_the_result_says_which_model_loaded_in_words_and_in_the_exit_code(tmp_path):
+    loader = ScriptedLoader({FOURTEEN_B: REFUSED_14B, NINE_B: None})
+    result = Rig(tmp_path, up=True, loader=loader).starter.ensure_ready()
+    assert f"{NINE_B} is loaded." in describe(result, load_requested=True)
+    assert result.succeeded(load_requested=True)
+
+
+def test_when_no_model_loads_the_reason_for_each_is_reported(tmp_path):
+    loader = ScriptedLoader({FOURTEEN_B: REFUSED_14B, NINE_B: NO_ROOM_9B})
+    result = Rig(tmp_path, up=True, loader=loader).starter.ensure_ready()
+    assert loader.asked == [FOURTEEN_B, NINE_B]
+    assert result.server_up and not result.model_loaded
+    assert result.model == FOURTEEN_B          # the first choice is still the one named
+    assert result.error == f"{REFUSED_14B}; {NO_ROOM_9B}"
+    assert result.refused == ""
+    assert not result.succeeded(load_requested=True)
+
+
+def test_a_reason_given_by_every_attempt_in_the_same_words_is_said_once(tmp_path):
+    # Reads exactly as it did when only one model was ever tried.
+    rig = Rig(tmp_path, up=True, loader_ok=False, loader_error="the card is full")
+    result = rig.starter.ensure_ready()
+    assert rig.loader.asked == [FOURTEEN_B, NINE_B]
+    assert result.error == "the card is full"
+
+
+def test_a_loader_that_gives_no_reason_still_yields_one_sentence_per_model(tmp_path):
+    loader = ScriptedLoader({FOURTEEN_B: "", NINE_B: ""})
+    result = Rig(tmp_path, up=True, loader=loader).starter.ensure_ready()
+    assert result.error == f"could not load {FOURTEEN_B}; could not load {NINE_B}"
+
+
+def test_naming_a_model_means_that_model_only(tmp_path):
+    loader = ScriptedLoader({FOURTEEN_B: REFUSED_14B, NINE_B: None})
+    result = Rig(tmp_path, up=True, loader=loader).starter.ensure_ready(model_key=FOURTEEN_B)
+    assert loader.asked == [FOURTEEN_B]       # the 9B would have loaded, and was not tried
+    assert not result.model_loaded and result.model == FOURTEEN_B
+    assert result.error == REFUSED_14B
+
+
+def test_naming_the_9b_does_not_fall_back_to_the_14b_either(tmp_path):
+    loader = ScriptedLoader({FOURTEEN_B: None, NINE_B: NO_ROOM_9B})
+    result = Rig(tmp_path, up=True, loader=loader).starter.ensure_ready(model_key=NINE_B)
+    assert loader.asked == [NINE_B]
+    assert not result.model_loaded and result.error == NO_ROOM_9B
+
+
+def test_the_list_of_models_comes_from_the_settings(tmp_path):
+    loader = ScriptedLoader({"a/one": "no room", "b/two": None})
+    rig = Rig(tmp_path, up=True, loader=loader, models=("a/one", "b/two"))
+    result = rig.starter.ensure_ready()
+    assert loader.asked == ["a/one", "b/two"] and result.model == "b/two"
+
+
+# ─────────────────────── the guards come before every attempt ───────────────────────
+
+
+def test_low_ram_stops_the_search_before_any_model_is_tried(tmp_path):
+    loader = ScriptedLoader({FOURTEEN_B: None, NINE_B: None})
+    result = Rig(tmp_path, up=True, ram=3100, loader=loader).starter.ensure_ready()
+    assert loader.asked == []
+    assert "3100" in result.refused and result.error == ""
+    assert result.model == FOURTEEN_B
+
+
+def test_an_unreadable_gpu_stops_the_search_before_any_model_is_tried(tmp_path):
+    loader = ScriptedLoader({FOURTEEN_B: None, NINE_B: None})
+    result = Rig(tmp_path, up=True, vram=None, loader=loader).starter.ensure_ready()
+    assert loader.asked == []
+    assert "GPU" in result.refused and result.error == ""
+
+
+def test_ram_is_read_again_before_the_second_model(tmp_path):
+    # The first attempt loaded and unloaded a model, so the machine is not what it was.
+    loader = ScriptedLoader({FOURTEEN_B: REFUSED_14B, NINE_B: None})
+    rig = Rig(tmp_path, up=True, loader=loader, memory=SequenceMemory([20000, 3000]))
+    result = rig.starter.ensure_ready()
+    assert loader.asked == [FOURTEEN_B]       # the 9B was never asked
+    assert not result.model_loaded
+    # Everything is in `error`, none in `refused`, so a caller that reads one field sees all.
+    assert result.refused == ""
+    assert result.error.startswith(REFUSED_14B)
+    assert f"{NINE_B} was not tried" in result.error
+    assert "3000" in result.error and "6144" in result.error
+    assert result.ram_free_mib == 3000
+
+
+def test_the_gpu_is_read_again_before_the_second_model(tmp_path):
+    loader = ScriptedLoader({FOURTEEN_B: REFUSED_14B, NINE_B: None})
+    rig = Rig(tmp_path, up=True, loader=loader, budget=SequenceBudget([14000, None]))
+    result = rig.starter.ensure_ready()
+    assert loader.asked == [FOURTEEN_B]
+    assert not result.model_loaded and result.refused == ""
+    assert result.error.startswith(REFUSED_14B)
+    assert f"{NINE_B} was not tried" in result.error and "GPU" in result.error
+
+
+def test_no_load_never_reaches_the_models(tmp_path):
+    loader = ScriptedLoader({FOURTEEN_B: None, NINE_B: None})
+    result = Rig(tmp_path, up=True, loader=loader).starter.ensure_ready(load_model=False)
+    assert loader.asked == [] and result.model == FOURTEEN_B and result.error == ""
+
+
+# ─────────────────────── from the command line ───────────────────────
+
+
+def run_real_starter(tmp_path, argv, loader):
+    """`main` driving the real starter, with only its collaborators faked."""
+    lines: list[str] = []
+    rig = Rig(tmp_path, up=True, loader=loader)
+    code = main(argv, starter=rig.starter, out=lines.append)
+    return code, lines
+
+
+def test_the_command_line_with_no_model_falls_back_and_exits_zero(tmp_path):
+    loader = ScriptedLoader({FOURTEEN_B: REFUSED_14B, NINE_B: None})
+    code, lines = run_real_starter(tmp_path, ["--json"], loader)
+    assert code == 0
+    assert loader.asked == [FOURTEEN_B, NINE_B]
+    assert json.loads(lines[0])["model"] == NINE_B
+
+
+def test_the_command_line_model_flag_means_no_fallback(tmp_path):
+    loader = ScriptedLoader({FOURTEEN_B: REFUSED_14B, NINE_B: None})
+    code, lines = run_real_starter(tmp_path, ["--model", FOURTEEN_B, "--json"], loader)
+    assert code == 1
+    assert loader.asked == [FOURTEEN_B]
+    answer = json.loads(lines[0])
+    assert answer["model"] == FOURTEEN_B and answer["model_loaded"] is False
+    assert answer["error"] == REFUSED_14B
+
+
+def test_the_command_line_says_every_reason_when_nothing_loads(tmp_path):
+    loader = ScriptedLoader({FOURTEEN_B: REFUSED_14B, NINE_B: NO_ROOM_9B})
+    code, lines = run_real_starter(tmp_path, [], loader)
+    assert code == 1
+    assert REFUSED_14B in lines[0] and NO_ROOM_9B in lines[0]
+    assert chr(0x2014) not in lines[0]

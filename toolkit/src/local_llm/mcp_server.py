@@ -77,6 +77,29 @@ class LocalLlmMcpServer:
         """Serve over stdio until the client disconnects."""
         self._server.run(transport="stdio")
 
+    def _model_for(self, task: str) -> str | None:
+        """The model a task should name, or None to let the client use the configured one.
+
+            "mcp_complete", default qwen3-14b loaded                 ->  "qwen/qwen3-14b"
+            "mcp_complete", default not loaded, qwen3.5-9b loaded    ->  "qwen/qwen3.5-9b"
+            "mcp_complete", the router raises                        ->  None
+
+        `local_complete` used to name no model, so the client always asked for the
+        configured one whatever was loaded. On a day when only the 9B fits on the card that
+        asked for a model that had to be loaded, which either evicts the working 9B or is
+        refused by the request gate while the 9B sits idle. The router now answers with the
+        model that is already loaded when the configured one is not, so this tool uses
+        what is there. The other two tools already ask the router; this one did not.
+
+        None on a routing failure is the old behaviour exactly, and a model that is not
+        loaded is then dealt with by the gate in the client. Routing must never be the
+        reason a call fails.
+        """
+        try:
+            return self._toolkit.router.choose(task)
+        except Exception:  # noqa: BLE001 - a routing failure falls back to the configured model
+            return None
+
     # ── tools ──
 
     def _register_tools(self) -> None:
@@ -182,7 +205,8 @@ class LocalLlmMcpServer:
 
             try:
                 text = await toolkit.client.complete(
-                    messages, tool="mcp_complete", max_tokens=max_tokens
+                    messages, tool="mcp_complete", max_tokens=max_tokens,
+                    model=self._model_for("mcp_complete"),
                 )
             except LocalLLMError as exc:
                 return {"error": str(exc)}

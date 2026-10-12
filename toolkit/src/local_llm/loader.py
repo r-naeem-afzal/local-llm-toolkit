@@ -30,6 +30,15 @@ one instance is resident and that the card still has breathing room, and unloads
 Estimating catches the obviously-impossible cheaply. Verifying catches everything else,
 including whatever the estimate got wrong. Neither alone is sufficient.
 
+## Every load names its context length
+
+`lms load` without `--context-length` lets LM Studio choose the context, and for
+qwen/qwen3.5-9b it chooses 234,752 tokens. With every layer on the GPU that fills a 16 GB
+card, and the verification above then has to unload a model that would have run well at
+32,768. So every load this module runs, whole-model or partial offload alike, passes
+`--context-length` (`Settings.load_context_length`, default 32768, which is also the 14B
+model's own maximum). The measurements are written out at that setting in `config.py`.
+
 ## Why overfilling matters more than it sounds
 
 Asking for more VRAM than the card has does not fail. Windows places the overflow in
@@ -50,6 +59,8 @@ from __future__ import annotations
 import subprocess
 import time
 from typing import Any
+
+from .config import DEFAULT_LOAD_CONTEXT_LENGTH
 
 
 class VramBudget:
@@ -289,37 +300,72 @@ class ModelLoader:
     _LOAD_OPTIONS = ("--gpu", "max", "--parallel", "1")
 
     def _load_flags(self, gpu_ratio: float | None) -> list[str]:
-        """The `lms load` flags for this load, with the GPU share chosen by the caller.
+        """The `lms load` flags for this load: GPU share from the caller, context from us.
 
-            gpu_ratio=None  ->  ["--gpu", "max",  "--parallel", "1"]   (all layers on GPU)
-            gpu_ratio=0.6   ->  ["--gpu", "0.6",  "--parallel", "1"]   (60% on GPU)
+            gpu_ratio=None  ->  ["--gpu", "max",  "--parallel", "1", "--context-length", "32768"]
+                                 (every layer on the GPU)
+            gpu_ratio=0.6   ->  ["--gpu", "0.60", "--parallel", "1", "--context-length", "32768"]
+                                 (60% of the layers on the GPU)
+
+        32768 is the default `Settings.load_context_length`.
 
         A ratio below 1 means part of the model is read from system RAM over PCIe during
         generation. For a **dense** model that is close to useless — every layer is needed
         for every token, so the slowest link sets the pace. It exists for **mixture-of-
         experts** models, where only a small share of the weights participates in any one
         token, and the idle remainder can sit in RAM costing nothing but address space.
+
+        The context flag is added on **both** paths, and that is a decision, not a detail.
+        `--context-length` is how many tokens of conversation the loaded model can hold;
+        LM Studio sizes the model's attention cache for that number at load time, so it
+        cannot be corrected afterwards without loading again. Left out, LM Studio picks
+        its own default, which for qwen/qwen3.5-9b is 234,752 tokens and fills a 16 GB
+        card. A partial-offload load that skipped the flag would hit exactly that, and
+        would look like a bad GPU ratio rather than a bad context.
         """
+        context = ["--context-length", str(self._context_length)]
         if gpu_ratio is None:
-            return list(self._LOAD_OPTIONS)
+            return [*self._LOAD_OPTIONS, *context]
         # Clamped because `lms` rejects anything outside 0-1 and a caller computing a
         # ratio from measured VRAM can land marginally outside by rounding — which would
         # fail the load for a reason that has nothing to do with the model.
         ratio = min(max(gpu_ratio, 0.0), 1.0)
-        return ["--gpu", f"{ratio:.2f}", "--parallel", "1"]
+        return ["--gpu", f"{ratio:.2f}", "--parallel", "1", *context]
 
-    def __init__(self, runner: Any, registry: Any, budget: VramBudget | None = None) -> None:
+    def __init__(self, runner: Any, registry: Any, budget: VramBudget | None = None,
+                 context_length: int = DEFAULT_LOAD_CONTEXT_LENGTH) -> None:
         self._runner = runner
         self._registry = registry
         # Optional so existing callers that build a loader with two arguments keep
         # working; without it the class behaves as it did before, doing the swapping but
         # none of the checking.
         self._budget = budget
+        # Refused here, at construction, rather than passed on to `lms`. A zero or negative
+        # number may be ignored by the CLI and replaced by LM Studio's own default context,
+        # which is the 234,752-token load this argument exists to prevent. Failing loudly
+        # when the loader is built is better than failing quietly on the first morning it
+        # is used with nobody home.
+        if context_length <= 0:
+            raise ValueError(
+                f"context_length must be a positive number of tokens, got {context_length}"
+            )
+        self._context_length = context_length
         # Why the last `ensure` failed, in words a person can act on. Kept because
         # returning a bare False tells a caller that something went wrong and nothing
         # about what, and "the model does not fit" and "the CLI is missing" want
         # completely different responses.
         self.last_error: str = ""
+
+    @property
+    def context_length(self) -> int:
+        """Tokens of context every load asks for. Read-only: chosen once, at construction.
+
+            ModelLoader(runner, registry, context_length=32768).context_length  ->  32768
+
+        Public so a caller can report what a load will ask for (a status line, a test)
+        without reading a private field.
+        """
+        return self._context_length
 
     # ── inspection ──
 
@@ -394,8 +440,9 @@ class ModelLoader:
            unload happens first and the run is left with *no* model.
         3. **Unload everything and wait for the memory to actually come back**, rather
            than assuming the command's return means the card is free.
-        4. **Load**, then confirm by asking what is resident rather than trusting the exit
-           code — `lms load` has been observed to accept options it then ignores.
+        4. **Load** with an explicit `--context-length` (see `_load_flags`), then confirm by
+           asking what is resident rather than trusting the exit code, because `lms load`
+           has been observed to accept options it then ignores.
         5. **Verify the card still has headroom**, which is the check the estimate cannot
            make and the one that catches whatever the estimate got wrong.
 

@@ -20,6 +20,12 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# The context length, in tokens, that every `lms load` asks for. A module constant rather
+# than a bare default on the field below because `loader.py` uses the same number as the
+# default for a loader built by hand, and two copies of one safety figure drift apart.
+# The reason for the number is written once, at `Settings.load_context_length`.
+DEFAULT_LOAD_CONTEXT_LENGTH = 32_768
+
 
 def _default_data_dir() -> Path:
     """Where the call database and live-progress files live.
@@ -243,7 +249,65 @@ class Settings(BaseSettings):
     lms_path: Path | None = None
     claude_projects_dir: Path | None = None
 
+    # ── loading models (loader.py, gate.py) ──
+    # The context length, in tokens, that every `lms load` asks for. Two measurements, made
+    # on the night of 7 to 8 October 2026, are the reason it is set at all:
+    #
+    #   1. LM Studio's own default context for qwen/qwen3.5-9b is 234,752 tokens. Loaded
+    #      with every layer on the GPU at that default, the model fills the 16 GB card,
+    #      because the attention cache (the "KV cache": memory the model keeps for each
+    #      token of context) grows with the context length. The guarded loader,
+    #      `ModelLoader.ensure`, caught it and unloaded the model again ("loaded but left
+    #      only 170 MiB free").
+    #   2. A request then reached the running server while no model was loaded, and LM
+    #      Studio loaded the model by itself with the same defaults and no guard at all:
+    #      15.8 GB used, 190 MiB free, and the answer crawled for eight minutes.
+    #
+    #       234,752 tokens (LM Studio's default for the 9B)  ->  card full
+    #        32,768 tokens (what is asked for now)           ->  7.2 times fewer tokens to
+    #                                                            keep a cache for
+    #
+    # 32768 is the 14B model's own maximum context, so one number serves both models. What
+    # breaks without it: any load that leaves the context to LM Studio takes the 9B to
+    # 234,752 tokens and fills the card, so the loader has to refuse and unload a model that
+    # would have run well at 32,768.
+    load_context_length: int = Field(
+        default=DEFAULT_LOAD_CONTEXT_LENGTH, gt=0,
+        description="Tokens of context passed as --context-length on every `lms load`.",
+    )
+    # Whether the client makes sure the model it is about to name is loaded before it sends
+    # a request (gate.py). On by default, because measurement 2 above is what happens
+    # without it: a request that names a model that is not loaded makes LM Studio load it
+    # itself ("just-in-time loading"), with its own defaults and none of this toolkit's
+    # checks. With the gate on, a missing model is loaded through `ModelLoader` or the
+    # request is refused and nothing is sent.
+    #
+    # Switch it off (LOCAL_LLM_GUARD_MODEL_LOADS=false, or Settings(guard_model_loads=False))
+    # only for a server that is not LM Studio, since the check uses the `lms` command, or for
+    # a script that loads its models itself and wants nothing in front of each request. The
+    # benchmark script is the second kind, but it can also leave the gate on: it loads each
+    # model before replaying, so the gate finds the model loaded and costs one cached lookup.
+    guard_model_loads: bool = Field(
+        default=True,
+        description="Load a missing model through the guarded loader before each request.",
+    )
+
     # ── unattended server start (server_start.py) ──
+    # The models the unattended starter tries, in this order, when no model is named on its
+    # command line. It stops at the first one that loads inside the guards, and says which
+    # one that was. The 14B is the better model; the 9B is the one that still fits on a
+    # day when other programs hold part of the card. `--model KEY` ignores this list and
+    # means exactly that one model, with no fallback. An environment variable has to be a
+    # JSON list, which is how pydantic-settings reads any list-valued setting:
+    #
+    #     LOCAL_LLM_UNATTENDED_MODELS=["qwen/qwen3-14b","qwen/qwen3.5-9b"]
+    #
+    # At least one entry is required: with an empty list the starter would have nothing to
+    # try and nothing honest to report.
+    unattended_models: tuple[str, ...] = Field(
+        default=("qwen/qwen3-14b", "qwen/qwen3.5-9b"), min_length=1,
+        description="Model keys the unattended starter tries in order.",
+    )
     # Refuse to load a model when less than this much system RAM is free. The runtime
     # memory-maps the model file, so a load takes host RAM as well as VRAM; starting one
     # on a machine with no RAM to spare makes Windows page to disk and the whole PC

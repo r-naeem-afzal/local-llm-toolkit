@@ -28,6 +28,7 @@ from .client import LocalLLMClient
 from .config import Settings
 from .database import DatabaseBackend, build_backend
 from .extract import ClaimExtractor, ExtractorChain, PageFetcher, PromptLibrary, ResultRanker
+from .gate import ResidencyGate
 from .membership import ListMembershipChecker
 from .loader import ModelLoader, VramBudget
 from .routing import ModelRouter
@@ -122,7 +123,27 @@ class Toolkit:
 
     @cached_property
     def client(self) -> LocalLLMClient:
-        return LocalLLMClient(self._settings, self.repository, self.live_store)
+        """The model client, with the residency gate in front of every request.
+
+        The gate is passed in unless `Settings.guard_model_loads` is off. This is the one
+        place that decides it: the client only knows it may have a gate, and the gate does
+        not know it can be switched off. What breaks without a gate: a request that names
+        a model that is not loaded makes LM Studio load it itself with its own defaults
+        and none of the loader's checks (see `gate.py` for the measurement).
+        """
+        gate = self.residency_gate if self._settings.guard_model_loads else None
+        return LocalLLMClient(self._settings, self.repository, self.live_store, gate=gate)
+
+    @cached_property
+    def residency_gate(self) -> ResidencyGate:
+        """Loads a missing model through the guarded loader before a request names it.
+
+        Built from the same loader and registry the dashboard and the unattended starter
+        use, so its idea of what is loaded comes from the same cached reading as theirs.
+        A singleton for a reason beyond tidiness: the gate's lock is what stops two
+        concurrent calls loading one model twice, and two gates would have two locks.
+        """
+        return ResidencyGate(self.loader, self.model_registry)
 
     @cached_property
     def prompts(self) -> PromptLibrary:
@@ -199,8 +220,15 @@ class Toolkit:
 
         Exists because just-in-time swapping between two 14B models on this card fails
         outright about as often as it succeeds — see `loader.py` for the measurement.
+
+        Every load it runs passes `--context-length` from `Settings.load_context_length`,
+        so a load never falls back to LM Studio's own default context (234,752 tokens for
+        the 9B, which fills the card). See `config.py` for the measurements.
         """
-        return ModelLoader(self.lms, self.model_registry, self.vram_budget)
+        return ModelLoader(
+            self.lms, self.model_registry, self.vram_budget,
+            context_length=self._settings.load_context_length,
+        )
 
     @cached_property
     def server_starter(self) -> ModelServerStarter:

@@ -1,12 +1,13 @@
 """Streaming client for an OpenAI-compatible local model server.
 
-Four classes, split by responsibility:
+Small classes, split by responsibility:
 
 * `StreamAccumulator` — understands the wire format. Given each streamed event it
   separates the answer from the model's private reasoning and tracks totals. It touches
   no network and no storage, so the trickiest logic here is testable with plain dicts.
 * `ProgressReporter` — decides when a progress frame is worth writing, and writes it.
 * `JsonResponseParser` / `ThinkingStripper` — small, single-purpose text handling.
+* `ModelGate`, the check that a model is loaded before a request may name it.
 * `LocalLLMClient` — performs the request and orchestrates the rest.
 
 What this buys over calling the endpoint directly:
@@ -23,6 +24,7 @@ What this buys over calling the endpoint directly:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -272,6 +274,31 @@ class CompletionClient(ABC):
         """Run one chat completion, returning a `schema` instance or the answer text."""
 
 
+class ModelGate(ABC):
+    """What must be true before a request may name a model: that the model is loaded.
+
+    A request needs a gate because LM Studio loads a model **by itself** when a request
+    names one that is not loaded ("just-in-time loading"), using its own defaults and none
+    of this toolkit's checks. Measured on the night of 7 to 8 October 2026, that automatic
+    load put 15.8 GB on a 16 GB card, left 190 MiB free, and the answer crawled for eight
+    minutes. A gate puts the toolkit's guarded loader in front of that: the model is
+    loaded safely first, or the request is refused and nothing is sent.
+
+    An abstract class so the client depends on this one narrow capability and not on the
+    loader or the registry (`gate.ResidencyGate` is the real implementation). A test
+    passes a fake gate, and the client then needs no `lms`, no GPU and no model server.
+    """
+
+    @abstractmethod
+    def ensure_resident(self, model: str) -> None:
+        """Return once `model` may safely be named in a request, or raise `LocalLLMError`.
+
+        Blocking: it may run `lms` and wait a minute for a load. The client calls it on a
+        worker thread (see `LocalLLMClient._ensure_resident`), so an implementation can be
+        an ordinary synchronous method.
+        """
+
+
 class LocalLLMClient(CompletionClient):
     """Talks to an OpenAI-compatible endpoint and records everything it does.
 
@@ -281,23 +308,69 @@ class LocalLLMClient(CompletionClient):
     """
 
     def __init__(self, settings: Settings, repository: CallRepository,
-                 live_store: LiveProgressStore) -> None:
+                 live_store: LiveProgressStore, gate: ModelGate | None = None) -> None:
         self._settings = settings
         self._repository = repository
         self._live = live_store
+        # Optional so existing callers that build a client with three arguments keep
+        # working. Without a gate the client sends whatever model it is asked for, which
+        # is how it behaved before the gate existed, including the unguarded automatic
+        # load described at `ModelGate`. `Toolkit` passes the real gate unless
+        # `Settings.guard_model_loads` is switched off.
+        self._gate = gate
         self._stripper = ThinkingStripper()
         self._json_parser = JsonResponseParser()
+
+    @property
+    def gate(self) -> ModelGate | None:
+        """The gate in front of every request, or None when requests are sent unchecked."""
+        return self._gate
 
     async def complete(self, messages: list[dict[str, str]], *,
                        schema: type[T] | None = None, tool: str = "complete",
                        meta: dict | None = None, max_tokens: int | None = None,
                        model: str | None = None) -> Any:
+        """Send one chat completion and return the answer, recording the whole call.
+
+            complete(messages, model="qwen/qwen3-14b")   ->  "OK"                (plain text)
+            complete(messages, schema=Claims)            ->  Claims(claims=[...])  (validated)
+
+        Every request, plain or structured, goes through this one method, so the order of
+        events below is the order for all of them:
+
+        1. Record that the call started, so even a refused call is on the record.
+        2. Ask the gate to make sure the model is loaded. Nothing is sent before this
+           returns, and nothing is sent at all if it refuses.
+        3. Start the clock, stream the answer, and report live progress.
+        4. Record the end: usage, timing, and either the answer or the error.
+        """
         model = model or self._settings.model
         token_budget = max_tokens or self._settings.max_tokens
 
+        # Step 1. Before the gate on purpose: a call refused for want of a model must leave
+        # an error row in the history. Without the row, the refusal would be visible only
+        # to whoever caught the exception, and for an unattended run the call history is
+        # the only record there is.
         call_id = self._repository.start_call(
             ts=self._now(), tool=tool, model=model, meta=meta or {}, prompt=messages,
         )
+        accumulator = StreamAccumulator()
+
+        # Step 2. The gate may load a model, which takes 18 seconds or more.
+        gate_began = time.monotonic()
+        try:
+            await self._ensure_resident(model)
+        except LocalLLMError as exc:
+            # 0.42 seconds in the gate  ->  420, the whole milliseconds the history stores.
+            gate_ms = int((time.monotonic() - gate_began) * 1000)
+            self._fail(call_id, str(exc), gate_ms, accumulator, meta)
+            raise
+
+        # Step 3. The clock starts here, after the gate and not before it. Started earlier,
+        # a call that had to load its model would record the load as part of its own
+        # duration and time to first token, so the first call of every shift would look
+        # far slower than the rest and every average on the dashboard would move for a
+        # reason that has nothing to do with how fast the model generates.
         started = time.monotonic()
 
         def elapsed_ms() -> int:
@@ -305,9 +378,11 @@ class LocalLLMClient(CompletionClient):
             # adjusted mid-call, which would otherwise record a negative duration.
             return int((time.monotonic() - started) * 1000)
 
-        accumulator = StreamAccumulator()
         # The subject comes from the call's metadata, which is where each caller already
         # records what it is working on — so no caller has to pass it twice.
+        #   meta={"url": "https://x.com/a"}      ->  "https://x.com/a"
+        #   meta={"question": "who pays whom?"}  ->  "who pays whom?"
+        #   meta=None                            ->  ""
         subject = str((meta or {}).get("url") or (meta or {}).get("question") or "")
         reporter = ProgressReporter(self._live, call_id, tool, model, subject)
         body = self._build_body(messages, model, token_budget, schema)
@@ -333,6 +408,29 @@ class LocalLLMClient(CompletionClient):
             raise LocalLLMError(message) from exc
 
         return self._finish(call_id, accumulator, schema, elapsed_ms(), token_budget, meta)
+
+    # ── the model gate ──
+
+    async def _ensure_resident(self, model: str) -> None:
+        """Run the gate, if there is one, without freezing the event loop.
+
+        `asyncio.to_thread` runs an ordinary blocking function on a helper thread and lets
+        this coroutine `await` its result. Under the hood the event loop (the one thread
+        that runs every coroutine in the process, including the other calls streaming at
+        this moment and the MCP server answering its own client) keeps going while the
+        helper thread waits for `lms`.
+
+        What breaks without the hop: the gate can spend a minute loading a model, and a
+        blocking call made directly inside this coroutine would stop every other coroutine
+        for that minute. Concurrent pipeline calls would stall mid-stream and the MCP
+        server would stop answering.
+
+        With no gate this returns at once and no thread is started, so a client built
+        without one pays nothing.
+        """
+        if self._gate is None:
+            return
+        await asyncio.to_thread(self._gate.ensure_resident, model)
 
     # ── request construction ──
 

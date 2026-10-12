@@ -155,7 +155,9 @@ class ModelRouter:
 
     # Which roles suit which tool, best first. A tool absent from this map falls through
     # to the configured default, which is the right behaviour for anything unclassified —
-    # better a known-working model than a guess.
+    # better a known-working model than a guess. The one refinement is
+    # `_default_or_resident`: when the configured default is not loaded but another
+    # language model is, that loaded model is used instead of asking for a load.
     _TASK_ROLES: dict[str, tuple[ModelRole, ...]] = {
         # Deciding what to search for benefits from weighing alternatives, and the output
         # is small, so the reasoning cost is affordable.
@@ -193,27 +195,92 @@ class ModelRouter:
             # falls back to the configured model, which is exactly the old behaviour.
             return []
 
-    def _loaded_keys(self) -> set[str]:
+    def _loaded_models(self) -> list[Any]:
+        """Every model instance in VRAM now, in the order `lms ps` lists them.
+
+            [LoadedModel(key="qwen/qwen3.5-9b", ...)]  ->  the same list
+            `lms ps` failing or the registry raising    ->  []   (treated as "nothing loaded")
+
+        A list, not a set, because `_default_or_resident` must pick the same model every
+        time when more than one is loaded, and a set has no order to pick from.
+        """
         try:
-            return {m.key for m in self._registry.loaded()}
+            return list(self._registry.loaded())
         except Exception:
-            return set()
+            return []
+
+    def _loaded_keys(self) -> set[str]:
+        """The distinct keys of the loaded models.
+
+            [9B instance, 9B instance ":2"]  ->  {"qwen/qwen3.5-9b"}   (one key, two copies)
+        """
+        return {m.key for m in self._loaded_models()}
+
+    def _default_or_resident(self) -> str:
+        """The configured model, unless it is not loaded and another language model is.
+
+            default qwen3-14b is loaded                          ->  "qwen/qwen3-14b"
+            default not loaded, qwen3.5-9b is                    ->  "qwen/qwen3.5-9b"
+            default not loaded, nothing is                       ->  "qwen/qwen3-14b"
+            default not loaded, only an embedding model is       ->  "qwen/qwen3-14b"
+
+        Why this exists. A task with no entry in `_TASK_ROLES`, such as the plain
+        `local_complete` tool, has no preferred role, so it always got the configured
+        model whatever was loaded. On a day when only the 9B fits on the card, that asked
+        for a model that would have to be loaded: the working 9B evicted for a 14B that
+        may not fit, or, with the request gate in front, a refusal while a perfectly good
+        9B sits idle. Using the loaded model costs nothing and risks nothing.
+
+        Only the unmapped path changes. A task with roles already prefers a loaded model
+        (see `choose`), and the other fall-through returns, for "no inventory at all", are
+        left exactly as they were.
+
+        An embedding model is never returned. It cannot answer a chat request, so
+        returning it would turn "the default is not loaded" into "the request fails". With
+        only an embedding model loaded the default is returned and the gate loads it.
+
+        If several language models are loaded the first one listed wins, so the answer
+        does not change between two calls a second apart.
+        """
+        default = self._settings.model
+        loaded = self._loaded_models()
+        if any(model.key == default for model in loaded):
+            return default
+
+        installed = {profile.key: profile for profile in self.profiles()}
+        for model in loaded:
+            # A loaded model can be missing from the installed list: `lms ls` once stopped
+            # listing a model that was demonstrably loaded and running (see `loader.py`).
+            # Dropping it would make a working model look like no model at all, so it is
+            # classified from the name and size it reports instead:
+            #   {"key": "text-embedding-nomic-embed-text-v1.5"}  ->  embedding, skipped
+            #   {"key": "qwen/qwen3.5-9b"}                       ->  a language model, used
+            profile = installed.get(model.key) or self._classifier.classify(
+                {"key": model.key, "size_mib": model.size_mib}
+            )
+            if ModelRole.EMBEDDING not in profile.roles:
+                return model.key
+        return default
 
     def choose(self, task: str, *, prefer_loaded: bool = True) -> str:
         """The model key to use for `task`, falling back to the configured default.
 
             choose("extract_claims")  ->  "qwen/qwen2.5-coder-14b"   (structured work)
             choose("plan_queries")    ->  "qwen/qwen3-14b"           (deliberation helps)
-            choose("anything_else")   ->  settings.model
+            choose("anything_else")   ->  settings.model, or the language model that is
+                                          loaded when settings.model is not
 
         With `prefer_loaded`, a resident model that can do the job wins over a marginally
         better one that is not loaded. On a card that holds one 14B at a time, swapping
         costs an ~18 second load — more than the task usually takes — so the "better"
         choice is frequently the slower one overall.
+
+        `prefer_loaded=False` means "ignore what is loaded" on every path, including this
+        one: an unmapped task then gets `settings.model` whatever is resident.
         """
         roles = self._TASK_ROLES.get(task)
         if not roles:
-            return self._settings.model
+            return self._default_or_resident() if prefer_loaded else self._settings.model
 
         profiles = self.profiles()
         if not profiles:

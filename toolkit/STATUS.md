@@ -395,21 +395,83 @@ runs and remains the check that actually catches an overfilled card.
 ## Unattended server start (proven with fakes only)
 
 `python -m local_llm.server_start [--model KEY] [--no-load] [--json]` makes sure the model
-server is up and the default model is loaded, for a caller with nobody at the keyboard
-(dayshift). It exits 0 only when the server answers and, unless `--no-load`, the model is
-loaded; `--json` prints one line with the result's fields.
+server is up and a model is loaded, for a caller with nobody at the keyboard (dayshift). It
+exits 0 only when the server answers and, unless `--no-load`, a model is loaded; `--json`
+prints one line with the result's fields.
 
 What it checks, in order, each step with a time limit: whether the server already answers;
 if not, `lms server start`, run once more if the server still does not answer (the cold
-start quirk above), then a bounded wait of 30 seconds; free system RAM against a floor
-(`LOCAL_LLM_MIN_FREE_RAM_MIB`, default 6144); that the GPU can be read at all (an unreadable
-GPU means "do not load" here, the opposite of `VramBudget.fits`); then
-`ModelLoader.ensure`, whose own VRAM guards decide. One lock file in the data directory
-(`server-start.lock`, taken over after 10 minutes) keeps two starters from racing.
+start quirk above), then a bounded wait of 30 seconds; then, for each model it may load and
+before every attempt, free system RAM against a floor (`LOCAL_LLM_MIN_FREE_RAM_MIB`,
+default 6144), that the GPU can be read at all (an unreadable GPU means "do not load" here,
+the opposite of `VramBudget.fits`), and `ModelLoader.ensure`, whose own VRAM guards decide.
+One lock file in the data directory (`server-start.lock`, taken over after 10 minutes)
+keeps two starters from racing.
 
-**Status: unit tests with fakes only** (`tests/test_server_start.py`). It has not yet been
-run against the real `lms` or a real load; the first real run will confirm the assumptions
-about `lms server start` output and exit codes.
+### Two measurements, and the four changes they led to (8 October 2026)
+
+Measured on the night of 7 to 8 October 2026:
+
+1. LM Studio's own default context for `qwen/qwen3.5-9b` is 234,752 tokens. Loaded with
+   every layer on the GPU at that default, it fills the 16 GB card. `ModelLoader.ensure`
+   caught it and unloaded the model again ("loaded but left only 170 MiB free").
+2. A request then reached the running server with no model loaded. LM Studio loaded the
+   model by itself, with the same defaults and no guard at all: 15.8 GB used, 190 MiB
+   free, and the answer crawled for eight minutes. So any tool call made while the server
+   was up and the model was not loaded could fill the card with nobody home.
+
+What changed:
+
+1. **A context length on every load.** `ModelLoader` passes `--context-length <n>` on every
+   `lms load` it runs, the whole-model path and the partial-offload path alike. The number
+   is the setting `load_context_length` (`LOCAL_LLM_LOAD_CONTEXT_LENGTH`), default 32768,
+   which is the 14B model's own maximum, so one number serves both models.
+2. **A gate in front of every request.** `ResidencyGate` (`gate.py`), wired in
+   `container.py`, is asked by `LocalLLMClient.complete` before anything is sent, for plain
+   and structured calls alike. If the registry shows the model is not loaded it calls
+   `ModelLoader.ensure`; if that returns False the request is refused with `LocalLLMError`,
+   carrying the loader's `last_error`, and nothing is sent. A model that is already loaded
+   costs one lookup in the registry's existing 3 second cache. One lock covers the check
+   and the load, so two concurrent calls load a missing model once; the second looks again
+   after the first has finished. The gate runs on a helper thread so a minute-long load does
+   not freeze the event loop, and a refused call still leaves an error row in the call
+   history. The setting `guard_model_loads` (`LOCAL_LLM_GUARD_MODEL_LOADS`, default true)
+   switches it off, for a server that is not LM Studio or a script that loads models itself.
+   The benchmark script can leave it on: it loads each model before replaying.
+3. **The router prefers what is loaded.** A task with no entry in the router's role map
+   used to get `settings.model` whatever was loaded. Now, if `settings.model` is not loaded
+   and another language model is (never an embedding model), that one is returned. The
+   plain `local_complete` MCP tool did not ask the router at all, so it now does; the other
+   two tools already did.
+4. **The starter tries more than one model.** With no model named it tries the setting
+   `unattended_models` (default `qwen/qwen3-14b`, then `qwen/qwen3.5-9b`) in order and
+   stops at the first that loads inside the guards. The result's `model` says which one
+   loaded; if none did, `error` gives the reason for each. `--model KEY` still means
+   exactly that model, with no fallback. The RAM floor and the unreadable-GPU refusal run
+   before every attempt, not only the first. The starter no longer reads `settings.model`
+   (`LOCAL_LLM_MODEL`); change `unattended_models` to change what it loads.
+
+**Status: proven with fakes only.** `tests/test_server_start.py`,
+`tests/test_loader_context.py`, `tests/test_residency_gate.py`, `tests/test_client_gate.py`,
+`tests/test_routing_fallback.py`, `tests/test_container_wiring.py`,
+`tests/test_load_settings.py` and `tests/test_mcp_local_complete.py` run without `lms`, a GPU
+or a model server. None of this has been run against the real `lms` or a real load. Until
+one real run is recorded here, treat every claim above as a design that passes its tests,
+not as a measured behaviour. The first real run has to confirm:
+
+- that `lms load` accepts `--context-length <n>` next to `--gpu`, `--parallel` and `-y`, and
+  that `lms ps` then reports a context of 32768 for the loaded model;
+- that both models, the 14B and the 9B, load at 32768 and pass the loader's headroom check;
+- that the `modelKey` in `lms ps --json` equals the name sent in requests, and that the
+  first copy of a model has an identifier equal to its key, so a request naming a loaded
+  model never makes LM Studio load a second copy;
+- that with the gate on and no model loaded, a tool call loads the model through the loader
+  (or is refused), and LM Studio does not load anything by itself;
+- that a model unloaded by the loader's own rollback stops looking loaded to the gate within
+  the registry's 3 second cache.
+
+Known limit: the gate checks that the model is loaded, not how it was loaded. A model that
+something else loaded earlier at an oversized context still passes, because it is loaded.
 
 ## Resume checklist
 
