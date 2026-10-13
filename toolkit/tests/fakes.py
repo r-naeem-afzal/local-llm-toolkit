@@ -15,19 +15,23 @@ from local_llm.monitor import LoadedModel
 from local_llm.store import CallRepository, LiveProgressStore
 
 
-def loaded_model(key: str, *, size_mib: int = 6706, identifier: str | None = None) -> LoadedModel:
+def loaded_model(key: str, *, size_mib: int = 6706, identifier: str | None = None,
+                 context_length: int = 32768, parallel: int = 1) -> LoadedModel:
     """A model as `lms ps` reports it, with the fields the toolkit reads.
 
         loaded_model("qwen/qwen3.5-9b")
-          ->  LoadedModel(key="qwen/qwen3.5-9b", identifier="qwen/qwen3.5-9b", size_mib=6706, ...)
+          ->  LoadedModel(key="qwen/qwen3.5-9b", identifier="qwen/qwen3.5-9b", size_mib=6706,
+                          context_length=32768, parallel=1, ...)
+        loaded_model("qwen/qwen3.5-9b", context_length=243968, parallel=4)
+          ->  the same model as the server loads it by itself: its own context, four slots
 
     The identifier defaults to the key, which is what LM Studio does for the first copy of
     a model. A second copy would be `loaded_model(key, identifier=key + ":2")`.
     """
     return LoadedModel(
         key=key, identifier=identifier or key, display_name=key, size_mib=size_mib,
-        context_length=32768, max_context_length=32768, status="idle",
-        quantisation="Q4_K_M", ttl_remaining_s=3600, queued=0, parallel=1,
+        context_length=context_length, max_context_length=32768, status="idle",
+        quantisation="Q4_K_M", ttl_remaining_s=3600, queued=0, parallel=parallel,
     )
 
 
@@ -54,11 +58,24 @@ class FakeRegistry:
     """
 
     def __init__(self, loaded: list[LoadedModel] | None = None,
-                 installed: list[dict[str, Any]] | None = None, raises: bool = False) -> None:
+                 installed: list[dict[str, Any]] | None = None, raises: bool = False,
+                 load_context: int = 32768, load_parallel: int = 1) -> None:
         self._loaded = list(loaded or [])
         self._installed = list(installed or [])
         self._raises = raises
+        # What the pretend server reports for a model after `mark_loaded`. The defaults
+        # are a server that does as it is asked. `load_context=243968` is the real app,
+        # which picks its own context; `load_parallel=4` is a load that came back with
+        # four prediction slots; 0 stands for an `lms` that does not report the field.
+        self._load_context = load_context
+        self._load_parallel = load_parallel
         self.loaded_lookups = 0
+        self.refreshes = 0
+
+    def refresh(self) -> None:
+        """The real registry drops its cached `lms` answers here. The fake has no cache,
+        so it only counts, which lets a test say "a fresh look was asked for"."""
+        self.refreshes += 1
 
     def loaded(self) -> list[LoadedModel]:
         self.loaded_lookups += 1
@@ -71,7 +88,8 @@ class FakeRegistry:
 
     def mark_loaded(self, key: str) -> None:
         """Pretend a load worked: afterwards `key` is the only model resident."""
-        self._loaded = [loaded_model(key)]
+        self._loaded = [loaded_model(key, context_length=self._load_context,
+                                     parallel=self._load_parallel)]
 
     def clear(self) -> None:
         """Pretend an unload worked: nothing is resident."""

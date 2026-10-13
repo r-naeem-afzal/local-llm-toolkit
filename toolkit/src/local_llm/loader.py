@@ -11,7 +11,7 @@ they were happening:
 
 * a router sent ranking to a small model while a 14B was resident, which loaded both and
   turned a 12 second extraction into 115 seconds; and
-* a single model was loaded **twice** — once by just-in-time loading and once explicitly —
+* a single model was loaded **twice**, once by just-in-time loading and once explicitly,
   producing instances `qwen/qwen2.5-coder-14b` and `qwen/qwen2.5-coder-14b:2`. Nothing
   noticed, because both report the same *model key* and only the *instance identifier*
   differs, so any check that deduplicates by key sees exactly one model.
@@ -21,36 +21,55 @@ and never load anything without first establishing that it fits.
 
 ## The two-part safeguard, and why one part is not enough
 
-`VramBudget` estimates before loading, so an impossible load is refused rather than
-attempted. But the estimate is a rule of thumb — the KV cache depends on the context the
-server chooses, which is not knowable in advance — so estimation alone would be false
-confidence. `ModelLoader` therefore also **verifies afterwards**: it checks that exactly
-one instance is resident and that the card still has breathing room, and unloads if not.
+`VramBudget` checks before loading, so an impossible load is refused rather than
+attempted. It can only reject the impossible: the weights themselves not fitting on the
+card. Everything else about a load is decided by the server and can only be read
+afterwards. `ModelLoader` therefore also **verifies afterwards**, and unloads the model
+again when any of these is false:
 
-Estimating catches the obviously-impossible cheaply. Verifying catches everything else,
-including whatever the estimate got wrong. Neither alone is sufficient.
+* exactly one instance is resident;
+* it was loaded with one prediction slot (`parallel` 1), read back from `lms ps`;
+* the card is not truly exhausted (a small floor of free memory, 100 MiB by default);
+* the model **answers at a usable speed**: one short fixed completion, timed, against a
+  floor of 20 tokens a second by default.
 
-## Every load names its context length
+The last one is the real test, and it replaced a fixed "at least 300 MiB free" rule. The
+next section says why free memory stopped meaning anything.
 
-`lms load` without `--context-length` lets LM Studio choose the context, and for
-qwen/qwen3.5-9b it chooses 234,752 tokens. With every layer on the GPU that fills a 16 GB
-card, and the verification above then has to unload a model that would have run well at
-32,768. So every load this module runs, whole-model or partial offload alike, passes
-`--context-length` (`Settings.load_context_length`, default 32768, which is also the 14B
-model's own maximum). The measurements are written out at that setting in `config.py`.
+## The context length that is asked for is not the one that is loaded
+
+Measured on 13 October 2026 (Bionic 1.1.1, engine llama.cpp 2.56.0, one 16 GB card):
+`lms load qwen/qwen3.5-9b --context-length 8192`, the same with 16384 and with 32768, all
+loaded the model with a context of 243,968 tokens. The app sizes the context to the free
+graphics memory by itself (its settings call this `autoFit`), so **every load fills the
+card on purpose**: 638 to 908 MiB were left free in five loads by hand, 148 MiB in one
+more. In that state the model was fast, not crawling: 109 tokens a second.
+
+Two things follow, and both are in the code below:
+
+1. `--context-length` does **not** bound the memory a load takes on this version. It is
+   still sent on every load, from `Settings.load_context_length`, because a later version
+   may honour it and a load with no number at all has nothing to honour. What was really
+   loaded is read back from `lms ps` and reported (`LoadReport`).
+2. Free memory after a load says nothing about whether the load is healthy, because a
+   healthy load and an overfilled one both leave the card nearly full. Speed tells them
+   apart, so speed is what is measured.
+
+`--parallel 1` **is** honoured, and it matters: the one crawling load on record (8 October
+2026) was a load the server made by itself with four slots.
 
 ## Why overfilling matters more than it sounds
 
 Asking for more VRAM than the card has does not fail. Windows places the overflow in
 shared system memory and the model keeps working, roughly fifteen times slower, with no
-error anywhere — `nvidia-smi` reports the same memory used and the same 100% utilisation
-either way. A guard that runs *before* the load is the only cheap way to avoid a state
-that is expensive to even detect.
+error anywhere: `nvidia-smi` reports the same memory used and the same 100% utilisation
+either way. The only place the difference shows is in how fast the model answers, which
+is why the check after a load asks it a question and times the answer.
 
 ## When it is worth swapping at all
 
 A research run extracts from dozens of pages, and extraction measurably yields more
-verified claims on the coder model than on the reasoning one at similar latency — so one
+verified claims on the coder model than on the reasoning one at similar latency, so one
 load repaid across forty calls is obviously worth it. A single ad-hoc call is not.
 """
 
@@ -58,9 +77,44 @@ from __future__ import annotations
 
 import subprocess
 import time
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from typing import Any
 
-from .config import DEFAULT_LOAD_CONTEXT_LENGTH
+from .config import (
+    DEFAULT_LOAD_CONTEXT_LENGTH,
+    DEFAULT_LOAD_LOCK_WAIT_S,
+    DEFAULT_MIN_FREE_VRAM_MIB,
+    DEFAULT_MIN_TOKENS_PER_SECOND,
+)
+from .childenv import lms_environment
+from .speed import SpeedProbe
+
+
+@dataclass(frozen=True)
+class LoadReport:
+    """What a load really produced, read back from the server after it.
+
+        asked for 32768, the app chose its own context, answered at 96.4 tokens a second
+          ->  LoadReport(model="qwen/qwen3.5-9b", context_asked=32768,
+                         context_loaded=243968, parallel_loaded=1,
+                         tokens_per_second=96.4, vram_free_mib=712)
+
+    Kept because the command that was sent and the load that resulted are not the same
+    thing: the app ignores the context length it is given (module docstring). Without
+    this record a caller would report the number it asked for as if it were the truth.
+
+    "Frozen" means the fields cannot be changed after creation. `None` in a field means
+    that value could not be read (an older `lms` that does not report it, no speed probe
+    configured, a card that cannot be read), never zero.
+    """
+
+    model: str
+    context_asked: int
+    context_loaded: int | None
+    parallel_loaded: int | None
+    tokens_per_second: float | None
+    vram_free_mib: int | None
 
 
 class VramBudget:
@@ -68,40 +122,35 @@ class VramBudget:
 
     Separate from `ModelLoader` because it is a different question. The loader knows how
     to drive the CLI; this knows what the card can hold. Splitting them means the budget
-    can be consulted by anything that wants to decide *whether* to swap — the router, the
-    dashboard — without that caller also acquiring the ability to load models.
+    can be consulted by anything that wants to decide *whether* to swap, the router, the
+    dashboard, without that caller also acquiring the ability to load models.
     """
 
-    # Memory that must stay free after a model is loaded. Not slack for its own sake: the
-    # desktop compositor, the browser and the editor all allocate on the same card, and
-    # their use moves by hundreds of megabytes as windows open and close. A load that fits
-    # with nothing to spare works until the moment something else asks for memory, and
-    # then the driver starts placing allocations in system RAM — which does not fail, it
-    # just runs about fifteen times slower, silently.
-    # Calibrated down from 700 because 700 refused the model the pipeline actually uses.
-    # Measured: qwen2.5-coder-14b sits at 14,193 MiB resident on a card with 14,765 MiB
-    # free once the desktop's 1,538 MiB is accounted for — so it runs, at 69 tok/s, with
-    # about 570 MiB to spare. A 700 MiB requirement would have blocked the known-good
-    # configuration, which is a worse failure than the one being prevented: a guard that
-    # refuses everything is indistinguishable from a broken pipeline.
+    # Room asked for on top of the weights before a load is allowed to start, in MiB.
     #
-    # 300 MiB is what is left over as genuine margin. The load is not being trusted to this
-    # number alone — `ModelLoader` verifies the card's state after loading, so the estimate
-    # only has to be good enough to reject the impossible.
-    _HEADROOM_MIB = 300
+    # Why this small: the app fits the context to whatever memory is left (module
+    # docstring), so the only load that cannot work is one whose weights do not fit. The
+    # margin covers the compute buffers every load needs beside its weights. What happens
+    # as a result: a model is refused before loading only when it is plainly too large,
+    # and every other question is answered after the load, by measurement.
+    #
+    # What breaks with a larger figure: the 14B was refused on 13 October 2026 as needing
+    # "about 14249 MiB" against 13,796 MiB free. That figure was weights times 1.66, an
+    # estimate of the whole footprint, set against a low guess of the free memory. The
+    # model was never tried. Loaded for real the same evening it left 907 MiB free and
+    # answered at 69.9 tokens a second.
+    _WEIGHTS_MARGIN_MIB = 512
 
-    # What a model costs beyond its own weights, as a multiple of the weights.
+    # What a loaded model gives back when it is unloaded, as a multiple of its weights.
     #
-    # Measured rather than derived, because the exact figure needs the KV-cache geometry
-    # (layers, key/value heads, head dimension) and the context length the server picks,
-    # neither of which the CLI exposes before loading. One calibration point:
+    # Used only by `ModelLoader._free_if_emptied`, to guess how much memory an unload will
+    # return without unloading. One calibration point:
     #
     #     qwen2.5-coder-14b   weights 8,571 MiB   resident total 14,193 MiB   = 1.66x
     #
-    # Used only to refuse loads that cannot possibly fit, and deliberately a little
-    # pessimistic: refusing a load that would have just fitted costs one stage a slower
-    # model, while allowing one that does not fit costs the whole run a fifteenfold
-    # slowdown that nothing reports.
+    # On this version of the app, which fills the card on every load, a resident model
+    # usually returns more than this. Too low is the safe direction: it under-states the
+    # free memory, which can only make the check before a load more careful.
     _OVERHEAD_FACTOR = 1.66
 
     def __init__(self, gpu_probe: Any) -> None:
@@ -127,7 +176,7 @@ class VramBudget:
         """The card's total VRAM, or None when it cannot be read.
 
         Needed as a ceiling on estimates. Without it, "how much would be free if
-        everything were unloaded" can exceed the physical card — which is not an
+        everything were unloaded" can exceed the physical card, which is not an
         arithmetic slip but the signature of the very problem being guarded against: it
         happens exactly when the resident models already total more than the card holds.
         """
@@ -145,29 +194,31 @@ class VramBudget:
         return None if gpu is None else int(gpu.free_mib)
 
     def required_mib(self, weights_mib: int) -> int:
-        """What a model of this weight actually occupies once loaded.
+        """A low guess at what a resident model of this weight gives back when unloaded.
 
-            8,571 MiB of weights  ->  14,227 MiB expected resident
-                                         (measured: 14,193 MiB — the factor is calibrated
-                                          on exactly this model, so treat it as a floor
-                                          for anything with different attention geometry)
+            8,571 MiB of weights  ->  14,227 MiB
+                                         (measured once: 14,193 MiB resident)
 
-        The gap is the KV cache and the compute buffers, which together are larger than
-        people expect — on a 14B at a 30k context the cache alone is about 4.7 GiB, more
-        than half the size of the weights again.
+        This does **not** decide whether a model may load: `fits` does. It is used to
+        guess how much memory unloading a resident model will return.
         """
         return int(weights_mib * self._OVERHEAD_FACTOR)
 
+    def weights_margin_mib(self) -> int:
+        """The room asked for beside the weights, so an error message can name it."""
+        return self._WEIGHTS_MARGIN_MIB
+
     def fits(self, weights_mib: int, *, already_free_mib: int | None = None) -> bool:
-        """Whether loading this model leaves the card with room to spare.
+        """Whether the weights alone, plus a small margin, fit in the free memory.
 
-            free 14,765 MiB, weights 8,571  ->  needs 14,227 + 300  ->  True  (just)
-            free 14,765 MiB, weights 11,548 ->  needs 19,169 + 300  ->  False
+            free 13,796 MiB, weights  8,584  ->  needs  9,096  ->  True
+            free 13,796 MiB, weights 19,072  ->  needs 19,584  ->  False
+            free  9,000 MiB, weights  8,584  ->  needs  9,096  ->  False
 
-        The first line is worth reading twice: the model this pipeline uses most fits with
-        about 600 MiB to spare on an otherwise empty card. That is not slack in the
-        arithmetic, it is the honest statement that this machine is one browser window away
-        from trouble with a 14B — which is worth knowing rather than rounding away.
+        Deliberately not an estimate of the whole footprint. The context, and with it most
+        of the memory beyond the weights, is chosen by the app at load time to fit what is
+        free, so there is nothing to estimate in advance. True here means "worth trying",
+        not "will run well": `ModelLoader` measures that after the load.
 
         Returns True when the card cannot be read at all. Refusing every load because
         `nvidia-smi` is missing would break a working setup to protect against a problem
@@ -176,25 +227,15 @@ class VramBudget:
         free = already_free_mib if already_free_mib is not None else self.free_mib()
         if free is None:
             return True
-        return self.required_mib(weights_mib) + self._HEADROOM_MIB <= free
-
-    def has_headroom(self) -> bool:
-        """Whether the card currently has enough free memory to be healthy.
-
-        Used *after* a load, as the check the estimate cannot provide. If this is false
-        with one model resident, the load overfilled the card whatever the arithmetic said
-        beforehand.
-        """
-        free = self.free_mib()
-        return True if free is None else free >= self._HEADROOM_MIB
+        return weights_mib + self._WEIGHTS_MARGIN_MIB <= free
 
 
 class OffloadPlanner:
     """Works out how much of a too-large model to keep on the card.
 
     Separate from both `VramBudget` (which answers "does it fit") and `ModelLoader` (which
-    drives the CLI) because this is a third question — "if it does not fit, what share
-    should go on the GPU?" — and it is a *policy* answer, tuned by measurement, while the
+    drives the CLI) because this is a third question, "if it does not fit, what share
+    should go on the GPU?", and it is a *policy* answer, tuned by measurement, while the
     other two are facts.
 
     ## The arithmetic, and why the reserve is a guess
@@ -209,20 +250,20 @@ class OffloadPlanner:
 
     The reserve is genuinely an estimate. The KV cache depends on the model's attention
     geometry and the context length the server chooses, neither of which `lms` reports
-    before loading. Qwen3-30B-A3B is unusually cheap here — 48 layers with 4 key/value
+    before loading. Qwen3-30B-A3B is unusually cheap here: 48 layers with 4 key/value
     heads works out near 96 KiB per token, about 3 GiB at a 32K context, *less* than the
-    14B it replaces despite being twice the size — but that is a per-model fact and this
+    14B it replaces despite being twice the size, but that is a per-model fact and this
     class cannot know it.
 
     So the number below is a deliberately generous starting point, and the honest workflow
-    is: plan a ratio, load, measure, adjust. `ModelLoader.ensure` verifies the card's state
-    afterwards and unloads if the reserve turned out to be too small, so a wrong guess
-    costs a failed load rather than a silently crawling one.
+    is: plan a ratio, load, measure, adjust. `ModelLoader.ensure` times a short answer
+    afterwards and unloads a model that is too slow, so a wrong guess costs a failed load
+    rather than a silently crawling one.
 
     What breaks without the reserve: the ratio comes out near 1.0, every layer is placed on
     a card with no room left for the cache, and the driver quietly moves the overflow into
     system memory. That state does not raise an error and does not look different in
-    `nvidia-smi` — it just runs about fifteen times slower, which is the failure this whole
+    `nvidia-smi`: it just runs about fifteen times slower, which is the failure this whole
     module exists to prevent.
     """
 
@@ -253,7 +294,7 @@ class OffloadPlanner:
 
         available = free_mib if free_mib is not None else self._budget.total_mib()
         if available is None:
-            # The card cannot be read. Refuse to invent a ratio — a wrong one is worse
+            # The card cannot be read. Refuse to invent a ratio: a wrong one is worse
             # than none, because it would place layers on a card whose size is unknown.
             return None
 
@@ -283,21 +324,23 @@ class ModelLoader:
     # overlap this class exists to prevent.
     _UNLOAD_SETTLE_S = 15
 
-    # How long the card is given to reach a healthy amount of free memory after a load.
-    # A swap has two models resident for a moment, and the released memory comes back a
-    # beat later, so anything shorter reports overflow that is not there.
-    _HEADROOM_SETTLE_S = 10
+    # How long the card is given to show its floor of free memory after a load. A swap has
+    # two models resident for a moment, and the released memory comes back a beat later,
+    # so anything shorter reports an exhausted card that is not one.
+    _FREE_FLOOR_SETTLE_S = 10
+
+    # The number of prediction slots every load asks for, and the number it must come back
+    # with. A slot is one conversation the server can generate for at a time. One, because
+    # there is one pipeline and one card, and each extra slot keeps its own share of the
+    # attention cache. The one crawling load on record (8 October 2026) had four.
+    _PARALLEL = 1
 
     # Options every load carries.
     #
     # `--gpu max` asks for every layer on the card. On its own it has not been shown to
     # change throughput, but it is what is wanted whenever the model fits, and the
     # alternative is letting the server decide silently.
-    #
-    # `--parallel 1` because there is one pipeline and one card. Each extra prediction
-    # slot wants its own KV cache, so `--parallel 4` multiplies the memory pressure this
-    # whole class exists to keep under control.
-    _LOAD_OPTIONS = ("--gpu", "max", "--parallel", "1")
+    _LOAD_OPTIONS = ("--gpu", "max", "--parallel", str(_PARALLEL))
 
     def _load_flags(self, gpu_ratio: float | None) -> list[str]:
         """The `lms load` flags for this load: GPU share from the caller, context from us.
@@ -310,51 +353,77 @@ class ModelLoader:
         32768 is the default `Settings.load_context_length`.
 
         A ratio below 1 means part of the model is read from system RAM over PCIe during
-        generation. For a **dense** model that is close to useless — every layer is needed
+        generation. For a **dense** model that is close to useless: every layer is needed
         for every token, so the slowest link sets the pace. It exists for **mixture-of-
         experts** models, where only a small share of the weights participates in any one
         token, and the idle remainder can sit in RAM costing nothing but address space.
 
-        The context flag is added on **both** paths, and that is a decision, not a detail.
-        `--context-length` is how many tokens of conversation the loaded model can hold;
-        LM Studio sizes the model's attention cache for that number at load time, so it
-        cannot be corrected afterwards without loading again. Left out, LM Studio picks
-        its own default, which for qwen/qwen3.5-9b is 234,752 tokens and fills a 16 GB
-        card. A partial-offload load that skipped the flag would hit exactly that, and
-        would look like a bad GPU ratio rather than a bad context.
+        The context flag is added on **both** paths. `--context-length` is how many tokens
+        of conversation the loaded model should hold. On the app version measured on
+        13 October 2026 the number is accepted and then ignored: the app sizes the context
+        to the free graphics memory by itself (module docstring). It is sent anyway, so
+        that a version that does honour it gets a sensible number without a code change,
+        and `_read_back` reports what was really loaded so nobody has to take the flag on
+        trust. What breaks if a reader assumes the flag works: they conclude a load is
+        bounded at 32,768 tokens of cache when it has in fact filled the card.
         """
         context = ["--context-length", str(self._context_length)]
         if gpu_ratio is None:
             return [*self._LOAD_OPTIONS, *context]
         # Clamped because `lms` rejects anything outside 0-1 and a caller computing a
-        # ratio from measured VRAM can land marginally outside by rounding — which would
+        # ratio from measured VRAM can land marginally outside by rounding, which would
         # fail the load for a reason that has nothing to do with the model.
         ratio = min(max(gpu_ratio, 0.0), 1.0)
-        return ["--gpu", f"{ratio:.2f}", "--parallel", "1", *context]
+        return ["--gpu", f"{ratio:.2f}", "--parallel", str(self._PARALLEL), *context]
 
     def __init__(self, runner: Any, registry: Any, budget: VramBudget | None = None,
-                 context_length: int = DEFAULT_LOAD_CONTEXT_LENGTH) -> None:
+                 context_length: int = DEFAULT_LOAD_CONTEXT_LENGTH,
+                 speed_probe: SpeedProbe | None = None,
+                 min_tokens_per_second: float = DEFAULT_MIN_TOKENS_PER_SECOND,
+                 min_free_vram_mib: int = DEFAULT_MIN_FREE_VRAM_MIB,
+                 sleep: Callable[[float], None] = time.sleep,
+                 load_lock: Any = None,
+                 load_lock_wait_s: float = DEFAULT_LOAD_LOCK_WAIT_S) -> None:
         self._runner = runner
         self._registry = registry
+        # The lock shared with every other process that may load a model (lockfile.py):
+        # needs wait_for(seconds, note) -> bool, release() and describe_holder() -> str.
+        # Passed in, so a test uses a temporary folder or a fake. Optional like the
+        # budget: a loader built by hand for a one-off script works without it and is
+        # then only safe while nothing else loads models.
+        self._load_lock = load_lock
+        self._load_lock_wait_s = load_lock_wait_s
         # Optional so existing callers that build a loader with two arguments keep
-        # working; without it the class behaves as it did before, doing the swapping but
-        # none of the checking.
+        # working; without it the class does the swapping and none of the memory checks.
         self._budget = budget
-        # Refused here, at construction, rather than passed on to `lms`. A zero or negative
-        # number may be ignored by the CLI and replaced by LM Studio's own default context,
-        # which is the 234,752-token load this argument exists to prevent. Failing loudly
-        # when the loader is built is better than failing quietly on the first morning it
-        # is used with nobody home.
+        # A sensible number is insisted on here, at construction, rather than passed on to
+        # `lms`. The app ignores the number today, but a version that honours it would
+        # take a zero as "use my own default", and failing loudly when the loader is built
+        # is better than failing quietly on the first morning it is used with nobody home.
         if context_length <= 0:
             raise ValueError(
                 f"context_length must be a positive number of tokens, got {context_length}"
             )
         self._context_length = context_length
+        # Asks the loaded model one short question and times the answer. Passed in, so a
+        # test hands over a fake and needs no server. Optional for the same reason the
+        # budget is: a loader built by hand for a script still swaps models, it only does
+        # not judge their speed.
+        self._speed_probe = speed_probe
+        self._min_tokens_per_second = min_tokens_per_second
+        self._min_free_vram_mib = min_free_vram_mib
+        # The waiting function. Real time by default; a test passes one that returns at
+        # once, so the ten second wait for a card that never recovers costs nothing.
+        self._sleep = sleep
         # Why the last `ensure` failed, in words a person can act on. Kept because
         # returning a bare False tells a caller that something went wrong and nothing
         # about what, and "the model does not fit" and "the CLI is missing" want
         # completely different responses.
         self.last_error: str = ""
+        # What the last `ensure` found loaded, read back from the server: see `LoadReport`.
+        # None until a model has been read back. Set on a failed check too, so the reason
+        # in `last_error` and the numbers behind it can be read together.
+        self.last_load: LoadReport | None = None
 
     @property
     def context_length(self) -> int:
@@ -383,7 +452,7 @@ class ModelLoader:
 
         Deliberately *not* the residency test to use before loading. Two instances of one
         model collapse to a single key here, which is exactly the blindness that let a
-        duplicate load go unnoticed — use `duplicates()` for that question.
+        duplicate load go unnoticed: use `duplicates()` for that question.
         """
         return {model.key for model in self.resident()}
 
@@ -415,7 +484,7 @@ class ModelLoader:
         """
         extras = self.duplicates()
         for model in extras:
-            # By identifier, not by key — unloading by key would be ambiguous between the
+            # By identifier, not by key: unloading by key would be ambiguous between the
             # copy being removed and the one being kept.
             self._run(["unload", model.identifier])
         return len(extras)
@@ -428,43 +497,96 @@ class ModelLoader:
 
         `gpu_ratio` places only that share of the model's layers on the card, leaving the
         rest in system RAM. Default None means "all of it", which is what any model that
-        fits should use. See `_load_flags` for when a ratio is worth setting — in short,
+        fits should use. See `_load_flags` for when a ratio is worth setting; in short,
         for a mixture-of-experts model and essentially never for a dense one.
+
+        The whole sequence runs inside the load lock shared by every process (see the
+        first lines of the method), so the look at what is loaded and the unload and load
+        that may follow are never interleaved with another process doing the same.
 
         The sequence, and why each step is there:
 
-        1. **Clear duplicates** even when the right model is already loaded — a second
+        1. **Clear duplicates** even when the right model is already loaded: a second
            copy of the right model is as damaging as the wrong model.
         2. **Refuse an impossible load** before touching anything, so a model too large
            for the card fails fast and leaves the working one alone. Without this the
            unload happens first and the run is left with *no* model.
         3. **Unload everything and wait for the memory to actually come back**, rather
            than assuming the command's return means the card is free.
-        4. **Load** with an explicit `--context-length` (see `_load_flags`), then confirm by
-           asking what is resident rather than trusting the exit code, because `lms load`
-           has been observed to accept options it then ignores.
-        5. **Verify the card still has headroom**, which is the check the estimate cannot
-           make and the one that catches whatever the estimate got wrong.
+        4. **Load**, then confirm by asking what is resident rather than trusting the exit
+           code, because `lms load` accepts options it then ignores (the context length
+           is one, see `_load_flags`).
+        5. **Read back what was really loaded** and check it: one prediction slot, a
+           floor of free memory, and an answer at a usable speed. These are the checks
+           that cannot be made in advance. A model that fails one is unloaded.
 
         Returns False rather than raising when anything fails. A caller that cannot get
-        its preferred model should carry on with whatever is loaded — a slower or slightly
+        its preferred model should carry on with whatever is loaded: a slower or slightly
         worse model is a far better outcome than aborting a run that has already paid for
         searching and ranking.
         """
         self.last_error = ""
+        self.last_load = None
 
+        if self._load_lock is None:
+            return self._ensure_in_turn(model_key, evict_others, gpu_ratio)
+
+        # One process at a time, across every process on the machine. Each agent runs
+        # its own copy of the MCP server, and they share one card. What breaks without
+        # this: two of them find the model missing at the same moment and each runs
+        # `unload --all` and `load`, which asks two models onto a card that holds one, or
+        # loads one model twice.
+        if not self._load_lock.wait_for(self._load_lock_wait_s, f"loading {model_key}"):
+            self.last_error = (
+                f"{model_key} was not loaded: another process holds the model load lock "
+                f"({self._load_lock.describe_holder()}) and did not release it within "
+                f"{self._load_lock_wait_s:.0f} seconds"
+            )
+            return False
+        # `finally` so the lock is given back even when something below raises. A lock
+        # left behind would make every other process wait out its full limit.
+        try:
+            # Look again, with a fresh answer. What this process read before it waited
+            # is out of date by exactly the thing that matters: the process it waited
+            # for has probably just loaded this very model. `_ensure_in_turn` starts by
+            # asking what is loaded, finds it, and loads nothing.
+            self._registry.refresh()
+            return self._ensure_in_turn(model_key, evict_others, gpu_ratio)
+        finally:
+            self._load_lock.release()
+
+    def _ensure_in_turn(self, model_key: str, evict_others: bool,
+                        gpu_ratio: float | None) -> bool:
+        """The body of `ensure`, run while this process holds the load lock.
+
+        Split out so the lock is taken and given back in exactly one place, and nothing
+        in the long sequence below can return without releasing it.
+        """
         if self.unload_duplicates():
             self._settle()
 
         # "The right model is loaded" is not the same as "the card is in a good state".
         # Returning early on the first condition alone was a real bug: with gpt-oss-20b
         # and the coder both resident, asking for the coder returned True and left 199 MiB
-        # free, because the coder *was* there — so the guard reported success on exactly
+        # free, because the coder *was* there, so the guard reported success on exactly
         # the overfilled card it exists to prevent. When eviction is wanted, the model must
         # be resident **and alone**.
         others = [key for key in self.resident_keys() if key != model_key]
         if model_key in self.resident_keys() and not (evict_others and others):
-            return True
+            report = self._read_back(model_key)
+            if report.parallel_loaded in (None, self._PARALLEL):
+                self.last_load = report
+                return True
+            # Resident, but not as this class loads it: something else loaded it with
+            # several prediction slots. That is what the server does by itself when a
+            # request names a model that is not loaded, and it is the one load on record
+            # that crawled. So it is removed here and loaded again below with one slot.
+            # What breaks if it is accepted as it stands: a day's work runs on the slow
+            # load because "the model is loaded" was true.
+            for model in self.resident():
+                if model.key == model_key:
+                    self._run(["unload", model.identifier])
+            self._settle()
 
         # Only now, with a load genuinely about to happen, is "does it fit" worth asking.
         # Asking earlier was a bug: it refused a model that was *already loaded and
@@ -474,13 +596,13 @@ class ModelLoader:
         weights_mib = self._weights_mib(model_key)
 
         # A model the registry has never heard of cannot be sized, so it cannot be checked
-        # — and an unsizeable model must not be allowed to cost a working one. Refusing
+        # and an unsizeable model must not be allowed to cost a working one. Refusing
         # here, *before* the unload, keeps whatever is currently resident.
         #
         # This is not hypothetical. `lms ls` stopped listing openai/gpt-oss-20b partway
         # through a session, so the size lookup returned 0, the "unknown means do not
         # block" rule skipped the check, and the loader unloaded a healthy coder model for
-        # a load that then failed — leaving the card with nothing on it. "Unknown" is a
+        # a load that then failed, leaving the card with nothing on it. "Unknown" is a
         # reason to be careful, not a reason to proceed.
         if not weights_mib and self.resident():
             self.last_error = (
@@ -491,17 +613,17 @@ class ModelLoader:
             return False
 
         # A caller asking for partial offload has *already decided* the weights do not all
-        # fit — that is what the ratio is for — so the whole-model fit check would refuse
+        # fit, that is what the ratio is for, so the whole-model fit check would refuse
         # every such load by definition. Skipping it here is not dropping the safeguard:
-        # the post-load headroom verification below still runs, and it is the check that
-        # actually catches an overfilled card. The estimate can only reject the
+        # the checks after the load below still run, and the timed answer is the one that
+        # actually catches an overfilled card. The check before a load can only reject the
         # impossible, and "impossible" is the wrong word for a load that is deliberately
         # placing some layers in system RAM.
         #
         # What breaks if this is left out: a mixture-of-experts model can never be loaded
-        # at all. An 18.6 GiB model estimates to roughly 31 GiB required against a 16 GiB
-        # card, so `fits` returns False and `ensure` keeps the smaller model — silently,
-        # from the caller's point of view, because the return value is a bare False.
+        # at all. Its 18.6 GiB of weights do not fit a 16 GiB card, so `fits` returns
+        # False and `ensure` keeps the smaller model, silently from the caller's point of
+        # view, because the return value is a bare False.
         if self._budget is not None and weights_mib and gpu_ratio is None:
             # Measured against an *empty* card rather than current free memory: everything
             # else is about to be unloaded, so the question is whether this model fits on
@@ -509,9 +631,10 @@ class ModelLoader:
             free_when_empty = self._free_if_emptied()
             if not self._budget.fits(weights_mib, already_free_mib=free_when_empty):
                 self.last_error = (
-                    f"{model_key} needs about "
-                    f"{self._budget.required_mib(weights_mib)} MiB but only "
-                    f"{free_when_empty} MiB would be free with nothing else loaded"
+                    f"{model_key} has {weights_mib} MiB of weights, which with a "
+                    f"{self._budget.weights_margin_mib()} MiB margin do not fit in the "
+                    f"{free_when_empty} MiB that would be free with nothing else loaded; "
+                    f"it was not loaded"
                 )
                 return False
 
@@ -529,39 +652,131 @@ class ModelLoader:
             self.last_error = f"{model_key} did not become resident after loading"
             return False
 
-        # A load can succeed and still leave the card in the state this class exists to
-        # avoid, if the estimate was wrong or something else took memory meanwhile.
-        # Unloading is the right response: running on an overfilled card is slower than
-        # running on the CPU would be, and unlike a failure it reports nothing.
-        if self._budget is not None and not self._await_headroom():
-            free = self._budget.free_mib()
-            self.last_error = (
-                f"{model_key} loaded but left only {free} MiB free; unloaded it rather "
-                f"than run in a state where allocations spill to system memory"
+        return self._verify_loaded(model_key)
+
+    def _verify_loaded(self, model_key: str) -> bool:
+        """Check a model that has just loaded, and unload it if a check fails.
+
+        A load can succeed and still leave the machine in the state this class exists to
+        avoid. Three checks, cheapest first, so a load that is wrong on its face is not
+        also asked to generate text:
+
+            parallel 4 read back              ->  unloaded, "loaded with 4 prediction slots"
+            40 MiB free, floor 100            ->  unloaded, "left only 40 MiB of graphics ..."
+            6.5 tokens a second, floor 20     ->  unloaded, "answered at 6.5 tokens a second"
+            148 MiB free, 96 tokens a second  ->  kept: a full card that answers fast is
+                                                  the normal state on this version
+
+        Unloading is the right response to a failure: running on an overfilled card is
+        slower than running on the CPU would be, and unlike a failure it reports nothing.
+        """
+        report = self._read_back(model_key)
+        self.last_load = report
+
+        # `None` (an `lms` that does not report the field) is let through: it is "cannot
+        # tell", and failing every load on a version that says less would break a working
+        # setup. A number that is not 1 is a fact, and is refused.
+        if report.parallel_loaded not in (None, self._PARALLEL):
+            return self._reject(
+                f"{model_key} loaded with {report.parallel_loaded} prediction slots "
+                f"although {self._PARALLEL} was asked for; unloaded it, because each slot "
+                f"keeps its own share of the context memory"
             )
-            self._run(["unload", "--all"])
-            return False
+
+        if not self._await_free_floor():
+            free = None if self._budget is None else self._budget.free_mib()
+            self.last_load = replace(report, vram_free_mib=free)
+            return self._reject(
+                f"{model_key} loaded but left only {free} MiB of graphics memory free, "
+                f"under the {self._min_free_vram_mib} MiB floor; unloaded it, because a "
+                f"card with nothing left spills the next allocation to system memory"
+            )
+
+        if self._speed_probe is not None:
+            reading = self._speed_probe.measure(model_key)
+            # `replace` makes a copy of the frozen record with some fields changed.
+            report = replace(
+                report,
+                tokens_per_second=None if reading.problem else reading.tokens_per_second,
+                # Read again after the answer: generating takes a little more memory than
+                # sitting idle, and this is the figure a caller wants to see.
+                vram_free_mib=None if self._budget is None else self._budget.free_mib(),
+            )
+            self.last_load = report
+            if reading.problem:
+                return self._reject(
+                    f"{model_key} loaded but did not pass the speed check "
+                    f"({reading.problem}); unloaded it"
+                )
+            if reading.tokens_per_second < self._min_tokens_per_second:
+                return self._reject(
+                    f"{model_key} loaded but answered at {reading.tokens_per_second:.1f} "
+                    f"tokens a second, under the {self._min_tokens_per_second:g} floor "
+                    f"(context {report.context_loaded}, {report.vram_free_mib} MiB of "
+                    f"graphics memory free); unloaded it rather than crawl through the day"
+                )
 
         return True
 
-    def _await_headroom(self) -> bool:
-        """Whether the card has room to spare, allowing time for memory to settle.
+    def _reject(self, reason: str) -> bool:
+        """Record why a loaded model is not being kept, unload it, and return False.
+
+        Returns False so the caller can write `return self._reject(...)`.
+        """
+        self.last_error = reason
+        self._run(["unload", "--all"])
+        return False
+
+    def _read_back(self, model_key: str) -> LoadReport:
+        """What the server says it really loaded, from `lms ps`.
+
+            {"modelKey": "qwen/qwen3.5-9b", "contextLength": 243968, "parallel": 1}
+              ->  LoadReport(model="qwen/qwen3.5-9b", context_asked=32768,
+                             context_loaded=243968, parallel_loaded=1,
+                             tokens_per_second=None, vram_free_mib=712)
+
+        The registry turns a missing field into 0, and no real load has a context or a
+        slot count of 0, so 0 is reported as None ("could not be read").
+
+        Under the hood: the registry keeps each `lms ps` answer for three seconds. The
+        answer used here is the one `_await_resident` has just fetched to see the model
+        arrive, so it already describes the new load.
+        """
+        loaded = next((model for model in self.resident() if model.key == model_key), None)
+        return LoadReport(
+            model=model_key,
+            context_asked=self._context_length,
+            context_loaded=(getattr(loaded, "context_length", 0) or None),
+            parallel_loaded=(getattr(loaded, "parallel", 0) or None),
+            tokens_per_second=None,
+            vram_free_mib=None if self._budget is None else self._budget.free_mib(),
+        )
+
+    def _await_free_floor(self) -> bool:
+        """Whether the card has its floor of free memory, allowing time for it to settle.
+
+            floor 100:  148 MiB free  ->  True       (a full card by design: normal)
+                         40 MiB free for ten seconds  ->  False
+                        card cannot be read           ->  True  (unknown is not "empty")
+
+        This floor is small on purpose. On this version of the app every load fills the
+        card, so a floor of a few hundred MiB refuses loads that run at full speed (148
+        MiB free at 96 tokens a second was measured). It is kept only for a card that is
+        truly exhausted; the timed answer is what judges everything above that.
 
         Checking once was wrong, and produced a false alarm on the first real run: the
         previous model's memory had not finished being released when the new one finished
-        loading, so a momentary reading of 452 MiB free was taken as proof of an overfilled
-        card. The loader then unloaded a model that was in fact fine — the very next
-        reading was 14,694 MiB free.
-
-        Both models being briefly resident is normal during a swap and says nothing about
-        the end state, so the check waits for the reading to become healthy rather than
-        judging the first sample. It gives up only if the card is still short after several
-        seconds, which is what a genuine overflow looks like: persistent, not transient.
+        loading, so a low momentary reading was taken as proof of an overfilled card. So
+        the check waits for the reading to recover and gives up only if the card is still
+        short after several seconds: persistent, not transient.
         """
-        for _ in range(int(self._HEADROOM_SETTLE_S * 2)):
-            if self._budget is None or self._budget.has_headroom():
+        if self._budget is None:
+            return True
+        for _ in range(int(self._FREE_FLOOR_SETTLE_S * 2)):
+            free = self._budget.free_mib()
+            if free is None or free >= self._min_free_vram_mib:
                 return True
-            time.sleep(0.5)
+            self._sleep(0.5)
         return False
 
     # ── internals ──
@@ -572,7 +787,7 @@ class ModelLoader:
             {"key": "qwen/qwen3.5-9b", "size_mib": 6706}  ->  6706
 
         Zero means "unknown", and every caller treats unknown as "do not refuse on these
-        grounds" — a missing size must not become a reason to block a load that would have
+        grounds": a missing size must not become a reason to block a load that would have
         worked.
         """
         try:
@@ -590,7 +805,7 @@ class ModelLoader:
 
         Computed rather than measured, because measuring it would mean unloading first and
         the point of the check is to decide *whether* to unload. The models' own weights
-        are a floor rather than the true figure — their KV caches come back too — so this
+        are a floor rather than the true figure, their KV caches come back too, so this
         under-estimates the free memory, which errs toward refusing a marginal load.
         """
         if self._budget is None:
@@ -599,7 +814,7 @@ class ModelLoader:
         if free is None:
             return None
         # Each resident model returns its *whole* footprint, not just its weights. Summing
-        # weights alone under-counted badly — with the coder resident and 398 MiB free it
+        # weights alone under-counted badly: with the coder resident and 398 MiB free it
         # estimated 8,969 MiB would be recovered, when the true figure is about 14,600,
         # because the KV cache is nearly as large as the weights and comes back too. That
         # under-count made the guard refuse the one model known to work.
@@ -608,7 +823,7 @@ class ModelLoader:
         )
 
         # Capped at the physical card. Two models whose weights total more than the card
-        # produced an estimate of 20,332 MiB free on a 16,303 MiB card — which is not a
+        # produced an estimate of 20,332 MiB free on a 16,303 MiB card, which is not a
         # slip in the arithmetic but the fingerprint of the overflow being guarded
         # against, since it can only happen when what is loaded already exceeds what fits.
         # Left uncapped, the guard would read that as abundant room and wave through the
@@ -625,12 +840,12 @@ class ModelLoader:
         so a fixed sleep is either wasteful or wrong.
         """
         if self._budget is None:
-            time.sleep(2.0)
+            self._sleep(2.0)
             return
         previous = -1
         deadline = time.monotonic() + self._UNLOAD_SETTLE_S
         while time.monotonic() < deadline:
-            time.sleep(0.5)
+            self._sleep(0.5)
             free = self._budget.free_mib()
             if free is None:
                 return
@@ -644,7 +859,7 @@ class ModelLoader:
         for _ in range(20):
             if model_key in self.resident_keys():
                 return True
-            time.sleep(1.0)
+            self._sleep(1.0)
         return False
 
     def _run(self, args: list[str]) -> bool:
@@ -668,6 +883,10 @@ class ModelLoader:
                 # codepage cannot decode, which raised UnicodeDecodeError inside
                 # subprocess's reader thread and made a successful load look like a crash.
                 encoding="utf-8", errors="replace",
+                # Without Electron's "run as a script engine" switch (childenv.py). A
+                # load may have to wake LM Studio's service first, and with the switch
+                # inherited from an editor the app exits instead of starting.
+                env=lms_environment(),
             )
             return completed.returncode == 0
         except (subprocess.TimeoutExpired, OSError):

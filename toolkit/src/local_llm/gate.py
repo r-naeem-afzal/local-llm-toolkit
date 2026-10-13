@@ -5,20 +5,22 @@
 LM Studio loads a model **by itself** when a request names one that is not loaded. This is
 called just-in-time loading ("JIT"). It is convenient and, on this machine, dangerous,
 because the automatic load uses LM Studio's own defaults and none of the checks in
-`loader.py`. Two measurements from the night of 7 to 8 October 2026:
+`loader.py`. Measured on the night of 7 to 8 October 2026: a request reached the running
+server while no model was loaded. LM Studio loaded qwen/qwen3.5-9b by itself, with four
+prediction slots (four conversations it can generate for at once, each with its own share
+of the context memory) and no guard: 15.8 GB used, 190 MiB free, and the answer crawled
+for eight minutes.
 
-* LM Studio's default context for qwen/qwen3.5-9b is 234,752 tokens. Loaded with every
-  layer on the GPU at that default, the model fills the 16 GB card. The guarded loader
-  caught this and unloaded it again ("loaded but left only 170 MiB free").
-* A request then reached the running server while no model was loaded. LM Studio loaded
-  the model by itself, with the same defaults and no guard: 15.8 GB used, 190 MiB free,
-  and the answer crawled for eight minutes.
+A full card alone is not the fault. Measured on 13 October 2026, the app fills the card
+on every load whatever context length it is asked for, and the same model loaded through
+`ModelLoader` with one slot answered at 109 tokens a second with the card just as full.
+What the automatic load lacks is the one slot and the check afterwards.
 
-So any tool call made while the server was up and the model was not loaded could fill the
-card with nobody home. `ResidencyGate` closes that. The client asks it before every
-request, and it either confirms the model is loaded, loads it through `ModelLoader` (which
-carries every VRAM check and an explicit context length), or refuses. A refused request is
-never sent.
+So any tool call made while the server was up and the model was not loaded could leave a
+crawling model in place with nobody home. `ResidencyGate` closes that. The client asks it
+before every request, and it either confirms the model is loaded, loads it through
+`ModelLoader` (one slot, then a timed answer that the model has to pass to stay loaded),
+or refuses. A refused request is never sent.
 
 ## Why one lock
 
@@ -29,10 +31,21 @@ pair `qwen/qwen2.5-coder-14b` and `qwen/qwen2.5-coder-14b:2`, and is described i
 `loader.py`. So the check and the load happen together under one lock, and a caller that
 had to wait for the lock looks again afterwards.
 
+That lock is a `threading.Lock`, which only the threads of this one process can see. It
+is not the whole answer, because the toolkit also runs as several processes at once: each
+agent has its own copy of the MCP server, and they share one card. The turn-taking
+between processes is a lock file taken inside `ModelLoader.ensure` (see `lockfile.py`).
+The gate needs to do nothing for it: when `ensure` has waited for another process it
+looks again at what is loaded, finds the model the other process loaded and returns True
+without loading. A process that cannot get its turn in time gets False and the reason,
+and the gate turns that into the usual refusal.
+
 ## Known limit
 
 The gate checks that the model is loaded, not how it was loaded. A model that something
-else loaded earlier at an oversized context still passes, because it is resident.
+else loaded earlier with several prediction slots still passes here, because it is
+resident. The unattended starter does catch that case: `ModelLoader.ensure` reads the
+slot count of a model it finds already loaded and loads it again if it is not one.
 """
 
 from __future__ import annotations

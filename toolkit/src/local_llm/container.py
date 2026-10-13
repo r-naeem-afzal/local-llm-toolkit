@@ -1,4 +1,4 @@
-"""The composition root — the one place that decides which concrete classes get used.
+"""The composition root: the one place that decides which concrete classes get used.
 
 Every other class in this package takes its collaborators through its constructor and
 never reaches for a global. That is what makes them testable, but something has to
@@ -15,7 +15,7 @@ a change here and nowhere else.
     extraction = await toolkit.claim_extractor.extract(url, question)
 
 Dependencies are created lazily and cached, so importing the package does not touch the
-disk or the GPU. That matters because a CLI asking one question — is the server up? —
+disk or the GPU. That matters because a CLI asking one question (is the server up?)
 should not pay to open a database and initialise NVML first.
 """
 
@@ -32,13 +32,9 @@ from .gate import ResidencyGate
 from .membership import ListMembershipChecker
 from .loader import ModelLoader, VramBudget
 from .routing import ModelRouter
-from .server_start import (
-    LockFile,
-    LmsServerCommand,
-    ModelServerStarter,
-    PsutilMemory,
-    SystemClock,
-)
+from .speed import CompletionSpeedProbe
+from .lockfile import LockFile, SystemClock, process_is_running
+from .server_start import LmsServerCommand, ModelServerStarter, PsutilMemory
 from .monitor import (
     ClaudeUsageReader,
     GpuProbe,
@@ -65,7 +61,7 @@ class Toolkit:
     `cached_property` is what makes each dependency lazy *and* a singleton within one
     Toolkit: the first access computes the value and replaces the property with it, so
     every later access returns the same instance. That single-instance behaviour is
-    required, not incidental — two `ConnectionProvider`s would mean two sets of
+    required, not incidental: two `ConnectionProvider`s would mean two sets of
     thread-local SQLite connections to the same file, doubling write contention for no
     reason.
     """
@@ -74,7 +70,7 @@ class Toolkit:
         # Settings are built here if not supplied, which is the seam a test uses to point
         # the whole graph at a temporary directory and a fake endpoint.
         self._settings = settings or Settings()
-        # Done once, here, rather than by every class that writes a file — so the "make
+        # Done once, here, rather than by every class that writes a file, so the "make
         # sure the folder exists" concern lives in exactly one place.
         self._settings.ensure_dirs()
 
@@ -194,7 +190,7 @@ class Toolkit:
     def url_canonicaliser(self) -> UrlCanonicaliser:
         """Shared so the pipeline and the search service agree on what "the same page"
         means. Two instances would not disagree today, but a rule added to one and not the
-        other would deduplicate differently in two places — and the symptom would be a
+        other would deduplicate differently in two places, and the symptom would be a
         report citing one source twice."""
         return UrlCanonicaliser()
 
@@ -219,16 +215,47 @@ class Toolkit:
         """Loads a model deliberately, rather than letting a request swap one mid-batch.
 
         Exists because just-in-time swapping between two 14B models on this card fails
-        outright about as often as it succeeds — see `loader.py` for the measurement.
+        outright about as often as it succeeds; see `loader.py` for the measurement.
 
-        Every load it runs passes `--context-length` from `Settings.load_context_length`,
-        so a load never falls back to LM Studio's own default context (234,752 tokens for
-        the 9B, which fills the card). See `config.py` for the measurements.
+        Every load it runs passes `--context-length` from `Settings.load_context_length`.
+        The app does not hold itself to that number (it sizes the context to the free
+        graphics memory), so the loader is also given the speed probe and the two floors
+        it judges a finished load by. See `config.py` for the measurements.
         """
         return ModelLoader(
             self.lms, self.model_registry, self.vram_budget,
             context_length=self._settings.load_context_length,
+            speed_probe=self.speed_probe,
+            min_tokens_per_second=self._settings.min_tokens_per_second,
+            min_free_vram_mib=self._settings.min_free_vram_mib,
+            load_lock=self.model_load_lock,
+            load_lock_wait_s=self._settings.model_load_lock_wait_s,
         )
+
+    @cached_property
+    def model_load_lock(self) -> LockFile:
+        """The lock every process takes around a model load.
+
+        A file, because the processes that must take turns (one MCP server per agent, the
+        unattended starter, the dashboard's API) share nothing else. See lockfile.py.
+        """
+        return LockFile(
+            self._settings.model_load_lock_path,
+            SystemClock(),
+            self._settings.model_load_lock_stale_s,
+            is_alive=process_is_running,
+        )
+
+    @cached_property
+    def speed_probe(self) -> CompletionSpeedProbe:
+        """Times one short answer from a loaded model, for the loader's check after a load.
+
+        Its own component, not a method of the loader, because "how fast does the model
+        answer" needs the server's address and an HTTP call, and the loader otherwise only
+        drives the `lms` command. Kept apart, a test gives the loader a fake probe and
+        needs no server.
+        """
+        return CompletionSpeedProbe(self._settings)
 
     @cached_property
     def server_starter(self) -> ModelServerStarter:
@@ -310,7 +337,7 @@ class Toolkit:
 
         The scanner remembers how far into each transcript it has read. Two instances
         would each re-read every file from the start, which is precisely the cost the
-        byte-offset tailing exists to avoid — so this must be one shared object, not a
+        byte-offset tailing exists to avoid, so this must be one shared object, not a
         fresh one per request.
         """
         return AgentTranscriptScanner()

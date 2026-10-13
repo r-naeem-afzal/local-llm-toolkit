@@ -37,6 +37,7 @@ from typing import Any
 
 import httpx
 
+from .childenv import lms_environment
 from .config import Settings
 
 # The plan allowance resets on a rolling 5-hour window, so this is the only window size
@@ -425,6 +426,16 @@ class LmsCommandRunner:
         """
         return self._executable()
 
+    def forget(self) -> None:
+        """Drop every cached answer, so the next `run` asks `lms` afresh.
+
+        For a caller that knows the answer may have changed behind its back. The model
+        loader calls this after waiting for another process to finish a load: what this
+        process cached before the wait says "nothing is loaded", and acting on that would
+        load the model a second time.
+        """
+        self._cache.clear()
+
     def run(self, *args: str) -> Any:
         """Run `lms <args> --json` and return the parsed result, or None on any failure.
 
@@ -451,6 +462,11 @@ class LmsCommandRunner:
                 # without this timeout the whole API request would block indefinitely.
                 timeout=15,
                 check=False,
+                # Without Electron's "run as a script engine" switch, which an editor
+                # passes down to everything started inside it. Any `lms` command may
+                # try to wake LM Studio's service, and with the switch inherited the
+                # app exits instead of starting. See childenv.py.
+                env=lms_environment(),
             )
             if completed.returncode != 0:
                 return None
@@ -482,6 +498,15 @@ class ModelRegistry:
 
     def __init__(self, runner: LmsCommandRunner) -> None:
         self._runner = runner
+
+    def refresh(self) -> None:
+        """Forget what was read a moment ago, so the next question is a fresh one.
+
+        Under the hood the command runner keeps each `lms` answer for three seconds. That
+        is right for a dashboard that polls and wrong for a decision to load a model made
+        just after another process may have loaded it.
+        """
+        self._runner.forget()
 
     def loaded(self) -> list[LoadedModel]:
         """Models currently resident in VRAM, from `lms ps`.

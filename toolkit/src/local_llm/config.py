@@ -1,4 +1,4 @@
-"""Configuration — a single data class describing how the toolkit should behave.
+"""Configuration: a single data class describing how the toolkit should behave.
 
 `Settings` is deliberately *only* data. It has no methods that do work, because every
 other class in the package takes a `Settings` instance through its constructor, and a
@@ -9,7 +9,7 @@ There is no module-level `get_settings()` singleton. That was the earlier shape 
 inverted the dependencies the wrong way: each class reached out to a global to discover
 its own configuration, which meant no class could be tested with different settings
 without patching a module attribute. Now the entry point builds one `Settings` and hands
-it down — see `container.Toolkit`, the single place that does this wiring.
+it down; see `container.Toolkit`, the single place that does this wiring.
 """
 
 from __future__ import annotations
@@ -26,6 +26,16 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # The reason for the number is written once, at `Settings.load_context_length`.
 DEFAULT_LOAD_CONTEXT_LENGTH = 32_768
 
+# The two floors a model has to clear after it has loaded. Module constants for the same
+# reason as the one above: `loader.py` uses them as defaults for a loader built by hand.
+# The reasons for the numbers are written once, at the fields `min_tokens_per_second` and
+# `min_free_vram_mib` below.
+DEFAULT_MIN_TOKENS_PER_SECOND = 20.0
+DEFAULT_MIN_FREE_VRAM_MIB = 100
+# How long one process waits for another to finish a model load: see the field
+# `model_load_lock_wait_s` below.
+DEFAULT_LOAD_LOCK_WAIT_S = 180.0
+
 
 def _default_data_dir() -> Path:
     """Where the call database and live-progress files live.
@@ -41,17 +51,17 @@ def _default_data_dir() -> Path:
 
 
 class DatabaseConfig(BaseModel):
-    """Where call history is stored — every database detail in one central block.
+    """Where call history is stored: every database detail in one central block.
 
     Name the engine, give it the connection settings it needs, and the toolkit uses it.
     Nothing outside this block mentions the database, so switching engines is a change
     here and nowhere else.
 
-        # .env — SQLite (the default; works with nothing set at all)
+        # .env: SQLite (the default; works with nothing set at all)
         LOCAL_LLM_DATABASE__ENGINE=sqlite
         LOCAL_LLM_DATABASE__NAME=C:/data/calls.db
 
-        # .env — MySQL
+        # .env: MySQL
         LOCAL_LLM_DATABASE__ENGINE=mysql
         LOCAL_LLM_DATABASE__NAME=local_llm
         LOCAL_LLM_DATABASE__HOST=127.0.0.1
@@ -61,7 +71,7 @@ class DatabaseConfig(BaseModel):
 
     The double underscore is pydantic-settings' nested delimiter: `DATABASE__HOST` sets
     `settings.database.host`. Two underscores rather than one so a field name that itself
-    contains an underscore stays unambiguous — `DATABASE__TIMEOUT_S` splits cleanly into
+    contains an underscore stays unambiguous: `DATABASE__TIMEOUT_S` splits cleanly into
     `database` and `timeout_s`, which a single delimiter could not do.
 
     Or set it in code:
@@ -69,13 +79,13 @@ class DatabaseConfig(BaseModel):
         Settings(database=DatabaseConfig(engine="mysql", name="local_llm",
                                          host="db.internal", user="llm", password="…"))
 
-    `name` means different things per engine — a file path for SQLite, a schema name for
-    MySQL — because keeping one field means switching engines does not also mean learning
+    `name` means different things per engine, a file path for SQLite, a schema name for
+    MySQL, because keeping one field means switching engines does not also mean learning
     a different set of keys.
     """
 
     # A Literal rather than a plain str so a typo is caught by validation at startup,
-    # naming the valid options, instead of failing later with "unknown engine" — or worse,
+    # naming the valid options, instead of failing later with "unknown engine", or worse,
     # silently falling back to SQLite while the user waits for rows to appear in MySQL.
     engine: Literal["sqlite", "mysql", "mariadb"] = Field(
         default="sqlite",
@@ -94,7 +104,7 @@ class DatabaseConfig(BaseModel):
     password: str = Field(default="")
     # utf8mb4 is the only MySQL charset that stores the whole of Unicode. The older
     # `utf8` alias is a three-byte subset that cannot hold emoji or many CJK characters,
-    # and model output routinely contains both — inserting them would raise
+    # and model output routinely contains both: inserting them would raise
     # "Incorrect string value" and lose the record.
     charset: str = Field(default="utf8mb4")
 
@@ -157,7 +167,7 @@ class Settings(BaseSettings):
     )
 
     # ── model endpoint ──
-    # 127.0.0.1 rather than "localhost", and this is not cosmetic — it was measured.
+    # 127.0.0.1 rather than "localhost", and this is not cosmetic: it was measured.
     #
     # On Windows, "localhost" resolves to the IPv6 address ::1 *before* IPv4 127.0.0.1.
     # LM Studio binds only to IPv4, so every connection first attempts ::1, waits for that
@@ -185,7 +195,7 @@ class Settings(BaseSettings):
     # ── generation ──
     temperature: float = 0.0
     # 2048 is generous on purpose. A reasoning model spends this budget on its own
-    # thinking *before* answering — Qwen3 14B used 203 output tokens simply to say "OK" —
+    # thinking *before* answering, Qwen3 14B used 203 output tokens simply to say "OK",
     # so a tight default would produce empty answers that look like model failures.
     max_tokens: int = 2048
     request_timeout_s: float = Field(
@@ -201,19 +211,19 @@ class Settings(BaseSettings):
     # Below this many characters of extracted text, re-fetch the page in a real browser.
     # 1,200 is deliberately low: it catches an empty or consent-gated page without paying
     # for a browser launch on every ordinary article. It does NOT catch a page whose body
-    # extracted fine but whose *table* was built by JavaScript — Paddle's supported-
+    # extracted fine but whose *table* was built by JavaScript: Paddle's supported-
     # countries page yields a perfectly normal-looking 2,715 characters with the country
     # list missing entirely. That case is caught by the caller passing `expect`, not by
     # this threshold, and assuming otherwise is what produced a week of confident wrong
     # answers about which countries are supported.
     browser_escalate_below_chars: int = Field(default=1200, ge=0)
     # How long to wait for a rendered page before giving up on one wait strategy.
-    # Generous because the pages worth escalating to a browser for are the slow ones —
+    # Generous because the pages worth escalating to a browser for are the slow ones:
     # a documentation site loading a table from an API is the whole use case.
     browser_page_timeout_s: float = Field(default=45.0, gt=0)
     # A fixed settle delay after the page reports ready. Frameworks routinely render a
     # table one tick later, and without this the fetch wins the race and captures the
-    # empty shell — which is indistinguishable from a page that genuinely has no table.
+    # empty shell, which is indistinguishable from a page that genuinely has no table.
     browser_settle_s: float = Field(default=2.5, ge=0)
     # When a membership check attributes a term to a heading this many lines back, re-read
     # the page in a browser before trusting the attribution. Measured: fetched over HTTP,
@@ -221,7 +231,7 @@ class Settings(BaseSettings):
     # onto a single line, so line-based heading attribution put Pakistan under the coarse
     # "Supported countries" 86 lines back instead of the precise "Bank payouts supported in
     # the following countries:" immediately above it. The browser's DOM text keeps one item
-    # per line. Without this, the check answers the question with the wrong list name — and
+    # per line. Without this, the check answers the question with the wrong list name, and
     # the list name is the entire answer.
     membership_reattribute_above_lines: int = Field(default=20, ge=0)
 
@@ -235,7 +245,7 @@ class Settings(BaseSettings):
     # ── storage / retention ──
     data_dir: Path = Field(default_factory=_default_data_dir)
     # The one central place every database detail lives. Swapping SQLite for MySQL is a
-    # change to this block and nothing else — no other setting mentions the database.
+    # change to this block and nothing else: no other setting mentions the database.
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     payload_days: int = Field(default=7, description="Keep full prompts/responses this long.")
     max_payloads: int = Field(default=500, description="Hard cap on stored payloads, newest kept.")
@@ -250,37 +260,71 @@ class Settings(BaseSettings):
     claude_projects_dir: Path | None = None
 
     # ── loading models (loader.py, gate.py) ──
-    # The context length, in tokens, that every `lms load` asks for. Two measurements, made
-    # on the night of 7 to 8 October 2026, are the reason it is set at all:
+    # The context length, in tokens, that every `lms load` asks for. The context is how
+    # much conversation the loaded model can hold, and the memory it keeps for each token of
+    # it (the attention cache, or "KV cache") grows with that number.
     #
-    #   1. LM Studio's own default context for qwen/qwen3.5-9b is 234,752 tokens. Loaded
-    #      with every layer on the GPU at that default, the model fills the 16 GB card,
-    #      because the attention cache (the "KV cache": memory the model keeps for each
-    #      token of context) grows with the context length. The guarded loader,
-    #      `ModelLoader.ensure`, caught it and unloaded the model again ("loaded but left
-    #      only 170 MiB free").
-    #   2. A request then reached the running server while no model was loaded, and LM
-    #      Studio loaded the model by itself with the same defaults and no guard at all:
-    #      15.8 GB used, 190 MiB free, and the answer crawled for eight minutes.
+    # This setting does NOT bound the memory a load takes on the app version measured on
+    # 13 October 2026 (Bionic 1.1.1, engine llama.cpp 2.56.0). The number is accepted and
+    # ignored: the app sizes the context to the free graphics memory by itself.
     #
-    #       234,752 tokens (LM Studio's default for the 9B)  ->  card full
-    #        32,768 tokens (what is asked for now)           ->  7.2 times fewer tokens to
-    #                                                            keep a cache for
+    #     --context-length 8192    ->  loaded with a context of 243,968 tokens
+    #     --context-length 16384   ->  243,968
+    #     --context-length 32768   ->  243,968
     #
-    # 32768 is the 14B model's own maximum context, so one number serves both models. What
-    # breaks without it: any load that leaves the context to LM Studio takes the 9B to
-    # 234,752 tokens and fills the card, so the loader has to refuse and unload a model that
-    # would have run well at 32,768.
+    # It is still sent, because a later version may honour it, and 32768 is the 14B
+    # model's own maximum, so one number would serve both models. What was really loaded
+    # is read back after every load and reported (`LoadReport` in loader.py). What breaks
+    # if this comment is not believed: a reader takes 32768 as the size of the load, and
+    # reads a card that is full by design as a fault.
     load_context_length: int = Field(
         default=DEFAULT_LOAD_CONTEXT_LENGTH, gt=0,
-        description="Tokens of context passed as --context-length on every `lms load`.",
+        description="Tokens of context passed as --context-length on every `lms load`. "
+                    "A request, not a limit: the app may load a different context.",
     )
+    # The slowest a freshly loaded model may answer and still be kept, in tokens a second.
+    # After every load the loader asks for one short fixed completion and times it
+    # (speed.py). Why speed and not free memory: every load fills the card on purpose, so
+    # free memory is a few hundred MiB whether the load is healthy or not, and only the
+    # speed tells them apart. Measured on the 16 GB card:
+    #
+    #     healthy load, one prediction slot   ->  63 to 109 tokens a second
+    #     overfilled load, four slots         ->  one answer in eight minutes, under 1
+    #
+    # 20 sits far from both, so a healthy model on a busy desktop passes and a load that
+    # has spilled into system memory does not. What breaks without the floor: a spilled
+    # load is kept, nothing reports it, and a day of work runs fifteen times slower.
+    min_tokens_per_second: float = Field(
+        default=DEFAULT_MIN_TOKENS_PER_SECOND, ge=0,
+        description="A loaded model answering slower than this is unloaded again.",
+    )
+    # The least graphics memory that must be free after a load, in MiB. Small on purpose:
+    # a healthy load was measured with 148 MiB free, so the 300 MiB this replaced refused
+    # loads that ran at full speed. It is kept only for a card that is truly exhausted,
+    # where the next allocation by any program spills to system memory.
+    min_free_vram_mib: int = Field(
+        default=DEFAULT_MIN_FREE_VRAM_MIB, ge=0,
+        description="A load that leaves less graphics memory free than this is unloaded.",
+    )
+    # How long a process waits for another process to finish loading a model before it
+    # gives up, in seconds. Several processes share one card (each agent has its own copy
+    # of the MCP server), and only one of them may unload and load at a time: the lock
+    # file `model-load.lock` in the data directory decides whose turn it is (lockfile.py).
+    # A load with its speed check takes about 15 seconds, so three minutes is a holder
+    # that has gone wrong, and the waiting process refuses with a sentence naming it.
+    # What breaks without a bound: one hung load would hang every agent with it.
+    model_load_lock_wait_s: float = Field(default=DEFAULT_LOAD_LOCK_WAIT_S, gt=0)
+    # A model-load lock older than this is treated as left behind and taken over. Longer
+    # than the longest honest load: `lms load` is given five minutes and the speed check
+    # two. A holder that has died is taken over sooner, as soon as it is seen to be gone.
+    model_load_lock_stale_s: float = Field(default=600.0, gt=0)
     # Whether the client makes sure the model it is about to name is loaded before it sends
-    # a request (gate.py). On by default, because measurement 2 above is what happens
-    # without it: a request that names a model that is not loaded makes LM Studio load it
-    # itself ("just-in-time loading"), with its own defaults and none of this toolkit's
-    # checks. With the gate on, a missing model is loaded through `ModelLoader` or the
-    # request is refused and nothing is sent.
+    # a request (gate.py). On by default, because of what was measured on the night of 7 to
+    # 8 October 2026 without it: a request reached the running server while no model was
+    # loaded, the server loaded the model itself ("just-in-time loading") with four
+    # prediction slots and none of this toolkit's checks, 190 MiB was left free and the
+    # answer crawled for eight minutes. With the gate on, a missing model is loaded
+    # through `ModelLoader` or the request is refused and nothing is sent.
     #
     # Switch it off (LOCAL_LLM_GUARD_MODEL_LOADS=false, or Settings(guard_model_loads=False))
     # only for a server that is not LM Studio, since the check uses the `lms` command, or for
@@ -318,8 +362,12 @@ class Settings(BaseSettings):
     # "Timed out waiting for LM Studio daemon to start" by itself after a while, so this
     # is only the backstop for a call that never returns at all.
     server_start_cmd_timeout_s: float = Field(default=60.0, gt=0)
-    # How long to wait for the endpoint to answer after the start commands have run.
-    server_start_wait_s: float = Field(default=30.0, gt=0)
+    # How long, in all, the starter keeps trying to bring the server up before it gives
+    # up: every `lms server start` call and every wait between them count against it.
+    # Measured on 13 October 2026: from cold the service behind `lms` (its "daemon") needs
+    # about a minute, and until then each call reports that it timed out. Two minutes is
+    # that minute twice over. It was 30 seconds, which gave up on a start that was working.
+    server_start_wait_s: float = Field(default=120.0, gt=0)
     # A lock file older than this is treated as left behind by a crashed starter.
     server_start_lock_stale_s: float = Field(default=600.0, gt=0)
 
@@ -327,7 +375,7 @@ class Settings(BaseSettings):
     # How long a *finished* agent stays on the dashboard. Finished agents linger instead
     # of vanishing because the dashboard detects a completion by watching a row change
     # status, and a row that disappears the instant it finishes can never be seen to
-    # finish — the notification would never fire.
+    # finish: the notification would never fire.
     agent_window_s: float = Field(default=60.0, ge=5.0)
     # How far back to look for transcripts holding a still-running agent. Deliberately
     # much wider than the display window: a parent session writes nothing at all while it
@@ -363,14 +411,24 @@ class Settings(BaseSettings):
         """The SQLite file path.
 
         Meaningful only when the engine is SQLite; a MySQL deployment has no file. Kept
-        as a property so callers that only ever run SQLite — the smoke test, a status
-        line — need not reach into the nested config.
+        as a property so callers that only ever run SQLite, the smoke test, a status
+        line, need not reach into the nested config.
         """
         return self.database.resolved_sqlite_path(self.data_dir)
 
     @property
     def server_start_lock_path(self) -> Path:
         return self.data_dir / "server-start.lock"
+
+    @property
+    def model_load_lock_path(self) -> Path:
+        """The file every process takes before it unloads or loads a model.
+
+        In the data directory because that is the one folder every copy of the toolkit
+        on a machine shares. Two copies pointed at different data directories would not
+        see each other's lock, and would also have two call histories.
+        """
+        return self.data_dir / "model-load.lock"
 
     @property
     def live_dir(self) -> Path:

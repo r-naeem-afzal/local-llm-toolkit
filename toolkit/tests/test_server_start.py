@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from local_llm.config import Settings
+from local_llm.loader import LoadReport
 from local_llm.server_start import (
     CommandOutcome,
     LockFile,
@@ -61,7 +62,9 @@ class FakeProbe:
 
 class FakeCommand:
     """`lms server start`. `ups` says, per call, whether that call brings the server up:
-    [False, True] is the cold-start quirk (first call fails, second works)."""
+    [False, True] is the cold start (first call reports the daemon timed out, second
+    works). Once the list is used up, no later call brings it up. `timeouts` records the
+    time limit each call was given."""
 
     def __init__(self, server: FakeServer, ups: list[bool], ran: bool = True,
                  timed_out: bool = False) -> None:
@@ -70,9 +73,11 @@ class FakeCommand:
         self._ran = ran
         self._timed_out = timed_out
         self.calls = 0
+        self.timeouts: list[float] = []
 
     def start(self, timeout_s: float) -> CommandOutcome:
         self.calls += 1
+        self.timeouts.append(timeout_s)
         if not self._ran:
             return CommandOutcome(False, False, None, "lms not found at X")
         if self._ups and self._ups.pop(0):
@@ -82,10 +87,19 @@ class FakeCommand:
 
 
 class FakeLoader:
-    def __init__(self, succeeds: bool = True, last_error: str = "") -> None:
+    def __init__(self, succeeds: bool = True, last_error: str = "",
+                 last_load: LoadReport | None = None,
+                 resident: tuple[str, ...] = ()) -> None:
         self._succeeds = succeeds
         self.last_error = last_error
+        # What the loader read back after loading, as the real one records it.
+        self.last_load = last_load
+        # The models that are loaded before the starter does anything.
+        self._resident = set(resident)
         self.asked: list[str] = []
+
+    def resident_keys(self) -> set[str]:
+        return set(self._resident)
 
     def ensure(self, key: str) -> bool:
         self.asked.append(key)
@@ -115,7 +129,7 @@ class Rig:
                  ran: bool = True, timed_out: bool = False, loader_ok: bool = True,
                  loader_error: str = "", vram: int | None = 14000, ram: int | None = 20000,
                  probe_raises: bool = False, loader=None, memory=None, budget=None,
-                 models: tuple[str, ...] | None = None) -> None:
+                 models: tuple[str, ...] | None = None, wait_s: float = 30) -> None:
         # `loader`, `memory`, `budget` and `models` are optional extras for the tests of
         # trying several models: they replace the plain fakes built from the arguments
         # above, and leave every earlier test exactly as it was.
@@ -130,7 +144,7 @@ class Rig:
         self.starter = ModelServerStarter(
             # _env_file=None so a developer's real .env cannot change what a test sees.
             settings=Settings(model=MODEL, min_free_ram_mib=6144,
-                              server_start_wait_s=30, _env_file=None, **extra),
+                              server_start_wait_s=wait_s, _env_file=None, **extra),
             probe=FakeProbe(self.server, probe_raises),
             command=self.command,
             loader=self.loader,
@@ -165,6 +179,45 @@ def test_cold_start_needs_the_second_call(tmp_path):
     result = rig.starter.ensure_ready()
     assert rig.command.calls == 2
     assert result.server_up and result.server_started_by_us and result.model_loaded
+    # One retry gap of 15 seconds was waited out between the two calls, and no more.
+    assert result.seconds == 15.0
+
+
+def test_a_daemon_that_needs_a_minute_is_waited_for(tmp_path):
+    # Measured on 13 October 2026: every call reports "Timed out waiting for LM Studio
+    # daemon to start" until the daemon is up, about a minute in. The fifth call, at 60
+    # seconds, is the first that works.
+    rig = Rig(tmp_path, ups=[False, False, False, False, True], wait_s=120)
+    result = rig.starter.ensure_ready()
+    assert rig.command.calls == 5
+    assert result.server_up and result.server_started_by_us and result.model_loaded
+    assert result.error == ""
+    assert result.seconds == 60.0
+
+
+def test_a_daemon_that_never_comes_up_is_given_two_minutes_and_no_more(tmp_path):
+    rig = Rig(tmp_path, ups=[], wait_s=120)
+    result = rig.starter.ensure_ready()
+    assert not result.server_up and not result.model_loaded
+    assert result.seconds == 120.0                 # the deadline, not a second longer
+    assert rig.command.calls == 8                  # one every 15 seconds for 120 seconds
+    assert "did not answer within 120 seconds" in result.error
+    assert "8 calls" in result.error
+    assert "Timed out waiting for LM Studio daemon to start" in result.error
+    assert rig.loader.asked == []                  # nothing loaded onto a server that is down
+    assert not rig.lock_path.exists()
+
+
+def test_the_default_wait_for_the_server_is_two_minutes():
+    assert Settings(_env_file=None).server_start_wait_s == 120.0
+
+
+def test_no_call_is_given_longer_than_the_time_that_is_left(tmp_path):
+    # The command's own limit is 60 seconds. With 30 seconds in all, the first call gets
+    # 30 and the second, started 15 seconds in, gets 15.
+    rig = Rig(tmp_path, ups=[], wait_s=30)
+    rig.starter.ensure_ready()
+    assert rig.command.timeouts == [30, 15]
 
 
 def test_first_call_enough_means_no_second_call(tmp_path):
@@ -176,7 +229,7 @@ def test_first_call_enough_means_no_second_call(tmp_path):
 def test_server_never_answers_is_bounded_and_reported(tmp_path):
     rig = Rig(tmp_path, ups=[False, False])
     result = rig.starter.ensure_ready()
-    assert rig.command.calls == 2          # exactly one retry, never a loop
+    assert rig.command.calls == 2          # one call every 15 seconds, inside 30
     assert not result.server_up and not result.model_loaded
     assert "did not answer within 30 seconds" in result.error
     assert rig.loader.asked == []           # nothing loaded onto a server that is down
@@ -346,8 +399,45 @@ def test_json_output_is_one_line_with_every_field():
     assert set(data) == {
         "server_up", "server_started_by_us", "model", "model_loaded", "refused", "error",
         "vram_free_mib", "ram_free_mib", "seconds",
+        "context_asked", "context_loaded", "parallel_loaded", "tokens_per_second",
+        "vram_free_after_load_mib",
     }
     assert data["model"] == MODEL and data["seconds"] == 1.5
+
+
+LOADED_9B = LoadReport(model="qwen/qwen3.5-9b", context_asked=32768, context_loaded=243968,
+                       parallel_loaded=1, tokens_per_second=96.4, vram_free_mib=712)
+
+
+def test_the_answer_carries_what_was_really_loaded(tmp_path):
+    # What was asked for (32768) and what the app loaded (243968) sit side by side.
+    rig = Rig(tmp_path, up=True, loader=FakeLoader(last_load=LOADED_9B))
+    lines: list[str] = []
+    code = main(["--json"], starter=rig.starter, out=lines.append)
+    data = json.loads(lines[0])
+    assert code == 0 and data["model_loaded"] is True
+    assert data["context_asked"] == 32768 and data["context_loaded"] == 243968
+    assert data["parallel_loaded"] == 1 and data["tokens_per_second"] == 96.4
+    assert data["vram_free_after_load_mib"] == 712
+    assert data["vram_free_mib"] == 14000          # still the reading before the load
+
+
+def test_the_load_fields_are_empty_when_no_model_was_loaded(tmp_path):
+    # The loader has a record from its failed attempt; a run that loaded nothing must not
+    # print it as if a model were resident.
+    rig = Rig(tmp_path, up=True,
+              loader=FakeLoader(succeeds=False, last_error="too slow", last_load=LOADED_9B))
+    result = rig.starter.ensure_ready()
+    assert not result.model_loaded and result.error == "too slow"
+    assert result.context_loaded is None and result.tokens_per_second is None
+    assert result.parallel_loaded is None and result.vram_free_after_load_mib is None
+
+
+def test_the_plain_sentence_says_what_was_really_loaded(tmp_path):
+    rig = Rig(tmp_path, up=True, loader=FakeLoader(last_load=LOADED_9B))
+    line = describe(rig.starter.ensure_ready(), load_requested=True)
+    assert ("qwen/qwen3-14b is loaded. Context 243968 tokens (32768 asked for), "
+            "1 prediction slot, 96.4 tokens a second, 712 MiB of graphics memory free.") in line
 
 
 def test_plain_output_is_sentences_without_em_dashes():
@@ -388,10 +478,12 @@ def test_unexpected_exception_becomes_an_error_line_and_exit_one():
 
 FOURTEEN_B = "qwen/qwen3-14b"
 NINE_B = "qwen/qwen3.5-9b"
-REFUSED_14B = ("qwen/qwen3-14b needs about 14227 MiB but only 9000 MiB would be free "
-               "with nothing else loaded")
-NO_ROOM_9B = ("qwen/qwen3.5-9b loaded but left only 170 MiB free; unloaded it rather than "
-              "run in a state where allocations spill to system memory")
+REFUSED_14B = ("qwen/qwen3-14b has 8584 MiB of weights, which with a 512 MiB margin do not "
+               "fit in the 9000 MiB that would be free with nothing else loaded; it was not "
+               "loaded")
+NO_ROOM_9B = ("qwen/qwen3.5-9b loaded but answered at 6.5 tokens a second, under the 20 "
+              "floor (context 243968, 190 MiB of graphics memory free); unloaded it rather "
+              "than crawl through the day")
 
 
 class ScriptedLoader:
@@ -401,10 +493,15 @@ class ScriptedLoader:
     that is not listed is refused as "not installed". Every model asked for is recorded.
     """
 
-    def __init__(self, outcomes: dict[str, str | None]) -> None:
+    def __init__(self, outcomes: dict[str, str | None],
+                 resident: tuple[str, ...] = ()) -> None:
         self._outcomes = outcomes
+        self._resident = set(resident)
         self.last_error = ""
         self.asked: list[str] = []
+
+    def resident_keys(self) -> set[str]:
+        return set(self._resident)
 
     def ensure(self, key: str) -> bool:
         self.asked.append(key)
@@ -524,6 +621,52 @@ def test_an_unreadable_gpu_stops_the_search_before_any_model_is_tried(tmp_path):
     result = Rig(tmp_path, up=True, vram=None, loader=loader).starter.ensure_ready()
     assert loader.asked == []
     assert "GPU" in result.refused and result.error == ""
+
+
+# ─────────────────── a model that is already loaded needs no guard ───────────────────
+#
+# Measured on 13 October 2026: with the 14B loaded, free RAM read 4,426 MiB, under the
+# 6,144 MiB floor, because a loaded model's file is itself held in RAM. The floor protects
+# against starting a load, and none is needed for a model that is there.
+
+
+def test_low_ram_does_not_refuse_a_model_that_is_already_loaded(tmp_path):
+    loader = ScriptedLoader({FOURTEEN_B: None, NINE_B: None}, resident=(FOURTEEN_B,))
+    result = Rig(tmp_path, up=True, ram=4426, loader=loader).starter.ensure_ready()
+    assert result.model_loaded and result.model == FOURTEEN_B
+    assert result.refused == "" and result.error == ""
+    assert loader.asked == [FOURTEEN_B]
+    assert result.ram_free_mib == 4426
+    assert result.succeeded(load_requested=True)
+
+
+def test_the_second_choice_is_kept_when_it_is_the_one_already_loaded(tmp_path):
+    # Yesterday's run fell back to the 9B. Today RAM is low because it is loaded: the 14B
+    # cannot be started, and the 9B is reported as the loaded model it is.
+    loader = ScriptedLoader({FOURTEEN_B: None, NINE_B: None}, resident=(NINE_B,))
+    result = Rig(tmp_path, up=True, ram=4426, loader=loader).starter.ensure_ready()
+    assert result.model_loaded and result.model == NINE_B
+    assert loader.asked == [NINE_B]           # the 14B was not started on low RAM
+
+
+def test_a_loaded_model_that_was_not_asked_for_does_not_lift_the_refusal(tmp_path):
+    loader = ScriptedLoader({FOURTEEN_B: None, NINE_B: None}, resident=(NINE_B,))
+    rig = Rig(tmp_path, up=True, ram=4426, loader=loader)
+    result = rig.starter.ensure_ready(model_key=FOURTEEN_B)
+    assert not result.model_loaded and "4426" in result.refused
+    assert loader.asked == []
+
+
+def test_a_loaded_model_that_fails_the_loader_s_checks_leaves_the_refusal(tmp_path):
+    loader = ScriptedLoader({FOURTEEN_B: "too slow", NINE_B: None}, resident=(FOURTEEN_B,))
+    result = Rig(tmp_path, up=True, ram=4426, loader=loader).starter.ensure_ready()
+    assert not result.model_loaded and "4426" in result.refused
+
+
+def test_an_unreadable_gpu_does_not_refuse_a_model_that_is_already_loaded(tmp_path):
+    loader = FakeLoader(last_load=LOADED_9B, resident=(FOURTEEN_B,))
+    result = Rig(tmp_path, up=True, vram=None, loader=loader).starter.ensure_ready()
+    assert result.model_loaded and result.tokens_per_second == 96.4
 
 
 def test_ram_is_read_again_before_the_second_model(tmp_path):

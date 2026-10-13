@@ -57,6 +57,24 @@ if errorlevel 1 (
     echo   The dashboard will still run and will show "model server down".
 )
 
+REM Which Python starts the API.
+REM
+REM `py` is the launcher that a python.org install puts on Windows, and it is
+REM tried first. The bare word `python` is only the fallback. On Windows that
+REM word can be taken over by a stub that does nothing except offer to install
+REM Python from the Microsoft Store (Settings, Apps, Advanced app settings, App
+REM execution aliases). The stub prints one line and exits, so the API window
+REM opened and closed at once and the dashboard showed "Cannot reach the API"
+REM with nothing on screen to say why. An update of the Python installer can
+REM switch the stub back on without asking, which is how this broke after
+REM working for weeks.
+REM
+REM `where` prints the full path of a command if Windows can find it and sets
+REM errorlevel 1 if it cannot. `&&` runs the second command only when the first
+REM succeeded, so PY becomes `py` only where that launcher exists.
+set PY=python
+where py >nul 2>&1 && set PY=py
+
 echo.
 echo === 2/3  API on http://127.0.0.1:7878 ===
 cd /d "%TOOLKIT%"
@@ -69,9 +87,9 @@ REM working directory it would also watch .local-llm-data, where the live
 REM progress files are rewritten several times a second during a generation -
 REM so the API would restart continuously while the model was working.
 if "%MODE%"=="dev" (
-    start "local-llm API [reload]" /min cmd /c "python -m uvicorn local_llm.api:app --port 7878 --reload --reload-dir src"
+    start "local-llm API [reload]" /min cmd /c "%PY% -m uvicorn local_llm.api:app --port 7878 --reload --reload-dir src"
 ) else (
-    start "local-llm API" /min cmd /c "python -m uvicorn local_llm.api:app --port 7878"
+    start "local-llm API" /min cmd /c "%PY% -m uvicorn local_llm.api:app --port 7878"
 )
 
 REM The dashboard's first request fires as soon as the page loads, so give the

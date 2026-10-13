@@ -1,9 +1,14 @@
 """Every `lms load` the loader runs names a context length.
 
-Without one, LM Studio picks its own: 234,752 tokens for qwen/qwen3.5-9b, which fills a
-16 GB card. These tests prove the flag is on the command for both loads the loader makes,
-whole-model and partial offload, using a loader whose only change is that it records the
-command instead of starting `lms`. No process is started and no model is loaded.
+These tests prove the flag is on the command for both loads the loader makes, whole-model
+and partial offload, using a loader whose only change is that it records the command
+instead of starting `lms`. No process is started and no model is loaded.
+
+They prove what is sent, not what the app does with it. On the app version measured on
+13 October 2026 the number is accepted and ignored (the app sizes the context to the free
+graphics memory), so the flag does not bound a load's memory. It is still sent for a
+version that honours it. What the loader does about the load that really results is in
+`test_loader_checks.py`.
 """
 
 from __future__ import annotations
